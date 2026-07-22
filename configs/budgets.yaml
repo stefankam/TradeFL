@@ -1,0 +1,4 @@
+{
+  "budgets": {"memory_bytes": 8589934592, "compute_seconds": 1000, "communication_bytes": 2000000000, "energy_joules": null, "latency_seconds": 1200, "privacy_risk": 0.50, "accuracy_loss": 0.20},
+  "enabled_metrics": {"memory": true, "compute": true, "communication": true, "energy": false, "latency": true, "privacy": true, "accuracy": true}
+}

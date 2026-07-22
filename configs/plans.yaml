@@ -1,0 +1,9 @@
+{"plans": [
+  {"plan_id": "full_finetuning", "type": "full_finetuning"},
+  {"plan_id": "lora_rank_8", "type": "lora", "rank": 8},
+  {"plan_id": "lora_rank_16", "type": "lora", "rank": 16},
+  {"plan_id": "qlora_4bit_rank_8", "type": "qlora", "rank": 8},
+  {"plan_id": "splitfed_layer_8", "type": "splitfed", "split_layer": 8, "activation_compression": false},
+  {"plan_id": "splitfed_layer_8_activation_compression", "type": "splitfed", "split_layer": 8, "activation_compression": true},
+  {"plan_id": "federated_distillation", "type": "distillation"}
+]}

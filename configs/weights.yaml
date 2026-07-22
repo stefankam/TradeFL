@@ -1,0 +1,9 @@
+{
+  "scenarios": {
+    "equal": {"memory": 0.1666666667, "compute": 0.1666666667, "communication": 0.1666666667, "energy": 0.0, "latency": 0.1666666667, "privacy": 0.1666666666, "accuracy": 0.1666666666},
+    "memory_constrained": {"memory": 0.30, "compute": 0.15, "communication": 0.15, "energy": 0.00, "latency": 0.20, "privacy": 0.00, "accuracy": 0.20},
+    "bandwidth_constrained": {"memory": 0.15, "compute": 0.10, "communication": 0.35, "energy": 0.00, "latency": 0.20, "privacy": 0.00, "accuracy": 0.20},
+    "quality_critical": {"memory": 0.10, "compute": 0.10, "communication": 0.10, "energy": 0.00, "latency": 0.15, "privacy": 0.00, "accuracy": 0.55}
+  },
+  "default_scenario": "equal"
+}
