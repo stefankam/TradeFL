@@ -1,4 +1,3 @@
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
 diff --git a/README.md b/README.md
 index f10334c38a176b6ddb5a373208e0542011caaa5b..8b6175e431f749684e7640a637597f0487959f10 100644
 --- a/README.md
@@ -559,6 +558,3 @@ index f10334c38a176b6ddb5a373208e0542011caaa5b..8b6175e431f749684e7640a637597f04
  
 -This repository is intended as a research prototype for academic use. Future extensions may integrate real federated learning frameworks (e.g., Flower, FedML, FedScale) and edge inference runtimes (e.g., ONNX Runtime, TensorRT, vLLM, MNN, ExecuTorch) to validate the token abstraction on practical deployments.
 +This is the first experimental milestone. Plan implementations are deterministic synthetic executables, not real transformer training loops. Energy measurement exposes a pluggable interface but returns `None` by default when hardware telemetry is unavailable. Empirical privacy attacks are intentionally left as future extensions behind the privacy scoring interface.
- 
-EOF
-)
