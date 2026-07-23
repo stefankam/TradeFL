@@ -1,4 +1,37 @@
 {
-  "experiment": {"num_clients": 5, "client_sampling_ratio": 1.0, "local_epochs": 1, "batch_size": 4, "sequence_length": 128, "profiling_rounds": 3, "repetitions": 3, "seeds": [42, 43, 44], "aggregation": "FedAvg", "target_quality": 0.80, "max_rounds": 5, "reference_utility": 0.90, "output_dir": "outputs", "overwrite": true},
-  "constraints": {"memory_capacity_bytes": 8589934592, "maximum_round_latency_seconds": 120, "maximum_time_to_target_seconds": 28800, "minimum_validation_utility": 0.80, "maximum_privacy_risk": 0.50, "hospital_edge_required": false, "public_cloud_allowed": false}
+  "experiment": {
+    "num_clients": 5,
+    "client_sampling_ratio": 1.0,
+    "local_epochs": 1,
+    "batch_size": 4,
+    "sequence_length": 128,
+    "profiling_rounds": 3,
+    "repetitions": 3,
+    "seeds": [42, 43, 44],
+    "aggregation": "FedAvg",
+    "target_quality": 0.80,
+    "max_rounds": 5,
+    "reference_utility": 0.90,
+    "primary_metric": "accuracy",
+    "output_dir": "outputs",
+    "overwrite": true,
+    "plans_config": "configs/plans.yaml"
+  },
+  "dataset": {
+    "name": "mednli",
+    "paths": {
+      "train": "data/mednli/train.jsonl",
+      "validation": "data/mednli/validation.jsonl",
+      "test": "data/mednli/test.jsonl"
+    }
+  },
+  "constraints": {
+    "memory_capacity_bytes": 8589934592,
+    "maximum_round_latency_seconds": 120,
+    "maximum_time_to_target_seconds": 28800,
+    "minimum_validation_utility": 0.80,
+    "maximum_privacy_risk": 0.50,
+    "hospital_edge_required": false,
+    "public_cloud_allowed": false
+  }
 }

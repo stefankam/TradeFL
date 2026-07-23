@@ -8,3 +8,4 @@ def test_budget_normalization():
 
 def test_missing_metric_handling():
     with pytest.raises(ValueError): normalize_metrics({}, Budgets(1,1,1,None,1,1,1))
+

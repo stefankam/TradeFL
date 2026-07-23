@@ -21,4 +21,3 @@ def test_cost_to_target_aggregation_prefers_lower_total():
 
 def test_deterministic_seed_handling():
     set_seed(7); a=random.random(); set_seed(7); assert random.random()==pytest.approx(a)
-
