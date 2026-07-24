@@ -1,15 +1,7 @@
 {
-  "selected_plan": "federated_distillation",
-  "score": 0.2682746861647175,
-  "normalized_costs": {
-    "memory": 0.16298145055770874,
-    "compute": 0.2,
-    "communication": 0.1,
-    "energy": null,
-    "latency": 0.21666666666666667,
-    "privacy": 0.6,
-    "accuracy": 0.33
-  },
+  "selected_plan": null,
+  "score": null,
+  "normalized_costs": null,
   "effective_weights": {
     "memory": 0.1666666667,
     "compute": 0.1666666667,
@@ -19,19 +11,8 @@
     "privacy": 0.1666666666,
     "accuracy": 0.1666666666
   },
-  "violated_constraints": [],
-  "alternatives": [
-    {
-      "plan_id": "federated_distillation",
-      "score": 0.2691080194977175
-    },
-    {
-      "plan_id": "federated_distillation",
-      "score": 0.2699413528307175
-    },
-    {
-      "plan_id": "qlora_4bit_rank_8",
-      "score": 0.28106993072613423
-    }
-  ]
+  "violated_constraints": [
+    "minimum_validation_utility_not_met"
+  ],
+  "alternatives": []
 }

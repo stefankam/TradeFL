@@ -1,0 +1,15 @@
+{
+  "dataset": "PubMedQA",
+  "records": {
+    "test": 100,
+    "train": 800,
+    "validation": 100
+  },
+  "seed": 42,
+  "source": "pubmedqa/pubmedqa GitHub repository",
+  "source_urls": [
+    "https://raw.githubusercontent.com/pubmedqa/pubmedqa/master/data/ori_pqal.json",
+    "https://raw.githubusercontent.com/pubmedqa/pubmedqa/master/data/test_ground_truth.json"
+  ],
+  "split_strategy": "deterministic 80/10/10 shuffle over PQA-L using --seed"
+}
