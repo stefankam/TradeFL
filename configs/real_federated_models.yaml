@@ -1,0 +1,53 @@
+{
+  "training": {
+    "batch_size": 1,
+    "gradient_accumulation_steps": 8,
+    "learning_rate": 0.0002,
+    "max_length": 512,
+    "bf16": true,
+    "fp16": false,
+    "compute_dtype": "bfloat16",
+    "device_map": "auto",
+    "temporary_output_dir": "/tmp/tradefl-client"
+  },
+  "federated_experiments": [
+    {
+      "experiment_id": "llama3_8b_qlora",
+      "model_id": "meta-llama/Meta-Llama-3-8B",
+      "architecture": "causal_lm",
+      "role": "federated_participant",
+      "method": "qlora",
+      "lora_rank": 8,
+      "lora_alpha": 16,
+      "lora_dropout": 0.05,
+      "aggregation": "FedAvg"
+    },
+    {
+      "experiment_id": "deepseek_r1_distill_llama_8b_lora",
+      "model_id": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+      "architecture": "causal_lm",
+      "role": "federated_participant",
+      "method": "lora",
+      "lora_rank": 8,
+      "lora_alpha": 16,
+      "lora_dropout": 0.05,
+      "aggregation": "FedAvg"
+    },
+    {
+      "experiment_id": "bio_clinicalbert_baseline",
+      "model_id": "emilyalsentzer/Bio_ClinicalBERT",
+      "architecture": "sequence_classification",
+      "role": "federated_participant",
+      "method": "full_finetuning",
+      "aggregation": "FedAvg"
+    }
+  ],
+  "external_models": [
+    {
+      "model_id": "gpt-4o",
+      "provider": "openai_api",
+      "role": "teacher_or_evaluator",
+      "federated_trainable": false
+    }
+  ]
+}

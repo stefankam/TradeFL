@@ -1,6 +1,19 @@
-"""Dataset-backed fine-tuning plan builder."""
-from .base import build_dataset_plan
+"""SplitFed-style client/server feature-partition reference plan."""
+from tradefl.backends import SplitFeatureBackend
+
+from .base import DatasetBackedFineTuningPlan, plan_constructor_kwargs
+
+
+class SplitFedPlan(DatasetBackedFineTuningPlan):
+    """Partition extracted features at the configured client/server cut."""
+
+    def create_backend(self) -> SplitFeatureBackend:
+        return SplitFeatureBackend(
+            self.dataset.labels,
+            split_layer=self.config.split_layer or 8,
+            activation_compression=self.config.activation_compression,
+        )
+
 
 def build(**kwargs):
-    plan_cfg = {key: value for key, value in kwargs.items() if key not in {"dataset", "seed", "experiment"}}
-    return build_dataset_plan(plan_cfg, kwargs["dataset"], kwargs["seed"], kwargs["experiment"])
+    return SplitFedPlan(**plan_constructor_kwargs(kwargs))

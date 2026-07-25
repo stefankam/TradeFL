@@ -1,8 +1,9 @@
-"""Deprecated module kept for import compatibility.
+"""Full-vocabulary supervised fine-tuning reference plan."""
+from .base import DatasetBackedFineTuningPlan, plan_constructor_kwargs
 
-TradeFL now profiles fine-tuning plans only. Configure adapter, quantized,
-SplitFed, or distillation plans in configs/plans.yaml instead of full training.
-"""
+class FullFineTuningPlan(DatasetBackedFineTuningPlan):
+    """Update the complete bag-of-words model without adapter constraints."""
 
-def build(**_: object):
-    raise ValueError("full_finetuning is not supported; TradeFL now runs fine-tuning plans only.")
+
+def build(**kwargs):
+    return FullFineTuningPlan(**plan_constructor_kwargs(kwargs))

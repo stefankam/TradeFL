@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import pickle
 import re
+import hashlib
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
@@ -32,7 +33,7 @@ class BagOfWordsFineTuningBackend:
 
         for record in records:
             self.class_counts[record.label] += 1
-            tokens = _tokenize(record.text)
+            tokens = self.features(record.text)
             self.token_counts[record.label].update(tokens)
             self.vocabulary.update(tokens)
 
@@ -65,7 +66,7 @@ class BagOfWordsFineTuningBackend:
             prior = (self.class_counts[label] + 1) / (total_examples + len(self.labels))
             label_token_total = sum(self.token_counts[label].values()) + vocab_size
             score = math.log(prior)
-            for token in _tokenize(text):
+            for token in self.features(text):
                 score += math.log((self.token_counts[label][token] + 1) / label_token_total)
             scores[label] = score
         return max(scores, key=scores.get)
@@ -76,5 +77,50 @@ class BagOfWordsFineTuningBackend:
         return len(pickle.dumps({"class_counts": self.class_counts, "token_counts": dict(self.token_counts)}))
 
 
+    def features(self, text: str) -> list[str]:
+        """Extract model features from text."""
+
+        return _tokenize(text)
+
+
+@dataclass
+class HashedAdapterBackend(BagOfWordsFineTuningBackend):
+    """Train a bounded hashed feature adapter instead of the full vocabulary."""
+
+    feature_buckets: int = 256
+    quantization_bits: int | None = None
+
+    def features(self, text: str) -> list[str]:
+        bucket_count = max(1, self.feature_buckets)
+        return [f"adapter_{_stable_bucket(token, bucket_count)}" for token in _tokenize(text)]
+
+    def serialized_size_bytes(self) -> int:
+        size = super().serialized_size_bytes()
+        if self.quantization_bits is None:
+            return size
+        return max(1, math.ceil(size * self.quantization_bits / 64))
+
+
+@dataclass
+class SplitFeatureBackend(BagOfWordsFineTuningBackend):
+    """Model a client/server split by transmitting a cut-layer representation."""
+
+    split_layer: int = 8
+    activation_compression: bool = False
+
+    def features(self, text: str) -> list[str]:
+        tokens = _tokenize(text)
+        stride = 2 if self.activation_compression else 1
+        cut = max(1, min(len(tokens), self.split_layer))
+        client = [f"client_{token}" for token in tokens[:cut:stride]]
+        server = [f"server_{token}" for token in tokens[cut::stride]]
+        return client + server
+
+
 def _tokenize(text: str) -> list[str]:
     return [match.group(0).lower() for match in _TOKEN_RE.finditer(text)]
+
+
+def _stable_bucket(token: str, bucket_count: int) -> int:
+    digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big") % bucket_count

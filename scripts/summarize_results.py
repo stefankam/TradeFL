@@ -52,9 +52,19 @@ def main() -> None:
 
 
 def summarize_results(input_path: Path, output_prefix: Path) -> None:
-    """Write CSV summary and at least ten PDF graphs from a plan_summary CSV."""
+    """Write graphs only from results proven to come from real federated training."""
 
     df = pd.read_csv(input_path)
+    required_mode = "real_federated"
+    if "training_mode" not in df.columns:
+        raise ValueError(
+            "Input CSV must include training_mode='real_federated'; "
+            "reference-model graphs are intentionally disabled."
+        )
+    unexpected = sorted(set(df["training_mode"].dropna().astype(str)) - {required_mode})
+    if unexpected or df["training_mode"].isna().any():
+        raise ValueError(f"Only training_mode='real_federated' can be graphed; found {unexpected or ['<missing>']}")
+
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
     summary = summarize_frame(df)
     summary.to_csv(str(output_prefix) + ".csv", index=False)

@@ -28,7 +28,7 @@ def main() -> None:
     dataset = load_dataset_bundle(cfg["dataset"])
     plans = load_yaml(exp.get("plans_config", "configs/plans.yaml"))["plans"]
     out = Path(exp.get("output_dir", "outputs"))
-    out.mkdir(exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
     if exp.get("overwrite", False):
         for name in ["raw_metrics.csv", "round_metrics.jsonl"]:
             (out / name).unlink(missing_ok=True)
@@ -48,6 +48,7 @@ def main() -> None:
                     "seed": seed,
                     "dataset": dataset.name,
                     "accuracy_loss": max(0, exp.get("reference_utility", 1.0) - summary["validation_utility"]),
+                    "training_mode": "reference_only",
                 }
             )
             summaries.append(summary)
