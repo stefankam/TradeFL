@@ -83,21 +83,19 @@ class DatasetBackedFineTuningPlan(TrainingPlan):
         self.local_epochs = max(1, local_epochs)
         self.primary_metric = primary_metric
         self.backend = BagOfWordsFineTuningBackend(dataset.labels)
-        self._cursor = 0
         self._rounds: list[dict[str, Any]] = []
 
     def setup(self) -> None:
-        self._cursor = 0
         self._rounds.clear()
         self.backend = BagOfWordsFineTuningBackend(self.dataset.labels)
 
     def run_round(self, round_index: int) -> dict[str, Any]:
-        batch = self._next_batch()
         counter = CommunicationCounter()
         before_size = self.backend.serialized_size_bytes()
         with Timer() as timer:
             for _ in range(self.local_epochs):
-                self.backend.train(batch)
+                for batch in self._training_batches():
+                    self.backend.train(batch)
         validation = self.backend.evaluate(self.dataset.validation)
         test = self.backend.evaluate(self.dataset.test)
         after_size = self.backend.serialized_size_bytes()
@@ -151,11 +149,13 @@ class DatasetBackedFineTuningPlan(TrainingPlan):
     def cleanup(self) -> None:
         return None
 
-    def _next_batch(self) -> list[Any]:
-        train = self.dataset.train
-        batch = [train[(self._cursor + offset) % len(train)] for offset in range(self.batch_size)]
-        self._cursor = (self._cursor + self.batch_size) % len(train)
-        return batch
+    def _training_batches(self) -> list[list[Any]]:
+        """Return one complete, non-overlapping pass over the training split."""
+
+        return [
+            self.dataset.train[start : start + self.batch_size]
+            for start in range(0, len(self.dataset.train), self.batch_size)
+        ]
 
     def _worst_client_utility(self) -> float:
         scores = self._client_scores()
