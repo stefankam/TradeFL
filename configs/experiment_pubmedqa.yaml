@@ -9,11 +9,11 @@
     "repetitions": 3,
     "seeds": [42, 43, 44],
     "aggregation": "FedAvg",
-    "target_quality": 0.40,
+    "target_quality": 0.80,
     "max_rounds": 5,
     "reference_utility": 0.90,
     "primary_metric": "accuracy",
-    "output_dir": "outputs/reference_only",
+    "output_dir": "outputs/reference_only/pubmedqa",
     "overwrite": true,
     "plans_config": "configs/plans.yaml"
   },

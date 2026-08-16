@@ -62,7 +62,9 @@ def ensure_dataset_available(dataset_config: dict[str, Any], seed: int = 42) -> 
         raise FileNotFoundError(
             "MedNLI files are missing and cannot be auto-downloaded because MedNLI "
             "requires PhysioNet credentialing and a signed DUA. See "
-            f"{output_dir / 'MEDNLI_REQUIRES_PHYSIONET_ACCESS.txt'}."
+            f"{output_dir / 'MEDNLI_REQUIRES_PHYSIONET_ACCESS.txt'}. "
+            "For the public auto-downloadable experiment, run: "
+            "python scripts/run_full_experiment.py --config configs/experiment.yaml"
         )
     raise ValueError("dataset.name must be either 'mednli' or 'pubmedqa'.")
 

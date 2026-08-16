@@ -13,16 +13,16 @@
     "max_rounds": 5,
     "reference_utility": 0.90,
     "primary_metric": "accuracy",
-    "output_dir": "outputs/reference_only",
+    "output_dir": "outputs/reference_only/pubmedqa",
     "overwrite": true,
     "plans_config": "configs/plans.yaml"
   },
   "dataset": {
-    "name": "mednli",
+    "name": "pubmedqa",
     "paths": {
-      "train": "data/mednli/train.jsonl",
-      "validation": "data/mednli/validation.jsonl",
-      "test": "data/mednli/test.jsonl"
+      "train": "data/PubMedQA/train.jsonl",
+      "validation": "data/PubMedQA/validation.jsonl",
+      "test": "data/PubMedQA/test.jsonl"
     }
   },
   "constraints": {

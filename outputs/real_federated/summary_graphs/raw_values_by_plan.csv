@@ -1,0 +1,8 @@
+plan_id,peak_memory_bytes,compute_to_target_seconds,communication_to_target_bytes,latency_to_target_seconds,energy_to_target_joules,privacy_risk,validation_utility,test_utility,rounds_to_target,tradefl_score,feasible,status
+llama3_8b_qlora,22917275989.333332,606.0114882138247,136314880.0,1510.1238331018637,,0.25,0.69,0.6966666666666667,1.0,,False,completed
+llama3_8b_lora,32215419904.0,243.1348691325014,136314880.0,1118.5078252178307,,0.25,0.7333333333333334,0.7333333333333334,1.0,,False,completed
+deepseek_r1_distill_llama_8b_lora,32215419904.0,242.423806136474,136314880.0,1058.3742363722995,,0.25,0.7433333333333333,0.67,1.0,,False,completed
+bio_clinicalbert_baseline,7024715264.0,21.639162046524387,4332503160.0,33.76338884079208,,0.25,0.59,0.49,1.0,0.75460994939421,True,completed
+bio_clinicalbert_splitfed,2250075648.0,21.479535651393235,6103885944.0,34.40019095906367,,0.25,0.59,0.49,1.0,0.9023387690000481,True,completed
+bio_clinicalbert_federated_distillation,2681542314.6666665,28.756351228182513,4332503160.0,41.82014927547425,,0.25,0.59,0.49,1.0,0.7653384444778801,True,completed
+gpt-4o,,,,,,,,,,,,external_not_federated

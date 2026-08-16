@@ -6,6 +6,7 @@
     "max_length": 512,
     "bf16": true,
     "fp16": false,
+    "use_cpu": null,
     "compute_dtype": "bfloat16",
     "device_map": "auto",
     "temporary_output_dir": "/tmp/tradefl-client"
@@ -17,6 +18,18 @@
       "architecture": "causal_lm",
       "role": "federated_participant",
       "method": "qlora",
+      "requires_cuda": true,
+      "lora_rank": 8,
+      "lora_alpha": 16,
+      "lora_dropout": 0.05,
+      "aggregation": "FedAvg"
+    },
+    {
+      "experiment_id": "llama3_8b_lora",
+      "model_id": "meta-llama/Meta-Llama-3-8B",
+      "architecture": "causal_lm",
+      "role": "federated_participant",
+      "method": "lora",
       "lora_rank": 8,
       "lora_alpha": 16,
       "lora_dropout": 0.05,
@@ -39,6 +52,25 @@
       "architecture": "sequence_classification",
       "role": "federated_participant",
       "method": "full_finetuning",
+      "aggregation": "FedAvg"
+    },
+    {
+      "experiment_id": "bio_clinicalbert_splitfed",
+      "model_id": "emilyalsentzer/Bio_ClinicalBERT",
+      "architecture": "sequence_classification",
+      "role": "federated_participant",
+      "method": "splitfed",
+      "split_layer": 6,
+      "aggregation": "FedAvg"
+    },
+    {
+      "experiment_id": "bio_clinicalbert_federated_distillation",
+      "model_id": "emilyalsentzer/Bio_ClinicalBERT",
+      "architecture": "sequence_classification",
+      "role": "federated_participant",
+      "method": "federated_distillation",
+      "distillation_temperature": 2.0,
+      "distillation_alpha": 0.5,
       "aggregation": "FedAvg"
     }
   ],

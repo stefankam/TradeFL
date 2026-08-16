@@ -1,0 +1,3 @@
+MedNLI is credentialed PhysioNet data. Download it from PhysioNet after credentialing and signing the DUA, then run:
+
+python scripts/obtain_data.py --dataset mednli --mednli-source-dir /path/to/mednli

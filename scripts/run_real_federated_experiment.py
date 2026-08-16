@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import sys
@@ -17,7 +18,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.obtain_data import ensure_dataset_available
 from tradefl.data import load_dataset_bundle
 from tradefl.federation.fedavg import iid_partition_indices, sample_weighted_fedavg
-from tradefl.federation.huggingface import HuggingFaceClientTrainer, tensor_state_nbytes
+from tradefl.federation.huggingface import (
+    HuggingFaceClientTrainer,
+    UnsupportedRuntimeError,
+    tensor_state_nbytes,
+    unavailable_runtime_reason,
+)
 from tradefl.utils.config import load_yaml
 from tradefl.utils.seeds import set_seed
 
@@ -28,18 +34,35 @@ def main() -> None:
     parser.add_argument("--models-config", default="configs/real_federated_models.yaml")
     parser.add_argument("--output-dir", default="outputs/real_federated")
     parser.add_argument("--experiment-id", action="append", help="Run only the selected experiment ID; repeatable.")
+    parser.add_argument("--strict-hardware", action="store_true", help="Fail instead of skipping models unsupported by this host.")
+    parser.add_argument(
+        "--cpu-smoke-test",
+        action="store_true",
+        help="Run a short two-client, one-round, one-seed Bio_ClinicalBERT pipeline check on CPU.",
+    )
+    parser.add_argument(
+        "--allow-slow-cpu",
+        action="store_true",
+        help="Allow the full Bio_ClinicalBERT study on CPU; it can take many hours or days.",
+    )
     args = parser.parse_args()
 
     experiment_cfg = load_yaml(args.experiment_config)
     models_cfg = load_yaml(args.models_config)
     exp = experiment_cfg["experiment"]
     training = {**models_cfg.get("training", {}), **{"local_epochs": exp.get("local_epochs", 1)}}
+    if args.cpu_smoke_test:
+        experiment_cfg, training = apply_cpu_smoke_profile(experiment_cfg, training)
+        exp = experiment_cfg["experiment"]
+    training["allow_slow_cpu"] = bool(args.allow_slow_cpu or args.cpu_smoke_test)
     ensure_dataset_available(experiment_cfg["dataset"], seed=int(exp["seeds"][0]))
     dataset = load_dataset_bundle(experiment_cfg["dataset"])
     selected = set(args.experiment_id or [])
     experiments = [
         item for item in models_cfg["federated_experiments"] if not selected or item["experiment_id"] in selected
     ]
+    if args.cpu_smoke_test:
+        experiments = [item for item in experiments if item["experiment_id"] == "bio_clinicalbert_baseline"]
     if selected - {item["experiment_id"] for item in experiments}:
         raise ValueError(f"Unknown experiment IDs: {sorted(selected - {item['experiment_id'] for item in experiments})}")
 
@@ -48,10 +71,57 @@ def main() -> None:
     round_path = output / "round_metrics.jsonl"
     round_path.unlink(missing_ok=True)
     summaries = []
+    skipped = []
     for model_config in experiments:
+        unavailable = unavailable_runtime_reason(model_config, training)
+        if unavailable:
+            if args.strict_hardware:
+                raise SystemExit(f"UNSUPPORTED {model_config['experiment_id']}: {unavailable}")
+            skipped.append({"experiment_id": model_config["experiment_id"], "seed": None, "reason": unavailable})
+            print(f"SKIPPED {model_config['experiment_id']}: {unavailable}", file=sys.stderr)
+            continue
         for seed in exp["seeds"]:
-            summaries.append(run_model_experiment(model_config, training, exp, dataset, seed, round_path))
+            try:
+                summaries.append(run_model_experiment(model_config, training, exp, dataset, seed, round_path))
+            except UnsupportedRuntimeError as exc:
+                if args.strict_hardware:
+                    raise
+                skipped.append({"experiment_id": model_config["experiment_id"], "seed": seed, "reason": str(exc)})
+                print(f"SKIPPED {model_config['experiment_id']} seed={seed}: {exc}", file=sys.stderr)
+                break
+    (output / "skipped_experiments.json").write_text(json.dumps(skipped, indent=2) + "\n", encoding="utf-8")
+    if not summaries:
+        raise SystemExit(
+            "No selected experiment can run with these hardware settings. On CPU use --cpu-smoke-test; "
+            "for the full study use CUDA (or explicitly acknowledge a very slow BERT run with --allow-slow-cpu)."
+        )
     pd.DataFrame(summaries).to_csv(output / "raw_metrics.csv", index=False)
+
+
+def apply_cpu_smoke_profile(experiment_cfg: dict, training: dict) -> tuple[dict, dict]:
+    """Create an explicit, practical CPU profile without changing the full study."""
+
+    experiment_cfg = copy.deepcopy(experiment_cfg)
+    experiment_cfg["experiment"].update(
+        {
+            "num_clients": 2,
+            "client_sampling_ratio": 1.0,
+            "max_rounds": 1,
+            "seeds": [experiment_cfg["experiment"]["seeds"][0]],
+        }
+    )
+    training = {
+        **training,
+        "use_cpu": True,
+        "batch_size": 4,
+        "gradient_accumulation_steps": 1,
+        "max_length": 128,
+        "evaluation_batch_size": 8,
+        "max_train_samples_per_client": 8,
+        "cpu_threads": 4,
+        "local_epochs": 1,
+    }
+    return experiment_cfg, training
 
 
 def run_model_experiment(model_config, training, exp, dataset, seed, round_path: Path) -> dict:
@@ -79,11 +149,23 @@ def run_model_experiment(model_config, training, exp, dataset, seed, round_path:
         uploaded = 0
         round_started = time.perf_counter()
         for client_id in selected_clients:
-            update = trainer.train_client(client_records[client_id], global_state)
+            local_records = client_records[client_id]
+            sample_limit = training.get("max_train_samples_per_client")
+            if sample_limit is not None:
+                local_records = local_records[: int(sample_limit)]
+            print(
+                f"TRAINING {model_config['experiment_id']} seed={seed} "
+                f"round={round_index + 1}/{exp['max_rounds']} "
+                f"client={client_id + 1}/{num_clients} examples={len(local_records)}",
+                flush=True,
+            )
+            update = trainer.train_client(local_records, global_state)
             updates.append((update.state, update.num_examples))
             compute_seconds += update.compute_seconds
             peak_memory = max(peak_memory, update.peak_accelerator_memory_bytes)
             uploaded += update.uploaded_bytes
+            downloads += update.downloaded_bytes
+            print(f"COMPLETED client={client_id + 1}/{num_clients} in {update.compute_seconds:.1f}s", flush=True)
         global_state = sample_weighted_fedavg(updates)
         validation = trainer.evaluate(dataset.validation, global_state)
         test = trainer.evaluate(dataset.test, global_state)
@@ -91,6 +173,7 @@ def run_model_experiment(model_config, training, exp, dataset, seed, round_path:
         row = {
             "plan_id": model_config["experiment_id"],
             "model_id": model_config["model_id"],
+            "method": model_config.get("method", "full_finetuning"),
             "seed": seed,
             "round_index": round_index,
             "selected_clients": selected_clients,
@@ -120,6 +203,7 @@ def run_model_experiment(model_config, training, exp, dataset, seed, round_path:
     return {
         "plan_id": model_config["experiment_id"],
         "model_id": model_config["model_id"],
+        "method": model_config.get("method", "full_finetuning"),
         "seed": seed,
         "dataset": dataset.name,
         "training_mode": "real_federated",

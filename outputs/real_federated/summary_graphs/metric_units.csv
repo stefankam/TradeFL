@@ -1,0 +1,12 @@
+metric,unit
+peak_memory_bytes,bytes
+compute_to_target_seconds,seconds
+communication_to_target_bytes,bytes
+latency_to_target_seconds,seconds
+energy_to_target_joules,joules
+privacy_risk,unitless
+validation_utility,accuracy fraction
+test_utility,accuracy fraction
+rounds_to_target,rounds
+tradefl_score,unitless composite (deployment-specific)
+feasible,boolean/rate
