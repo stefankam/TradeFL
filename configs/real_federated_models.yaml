@@ -76,10 +76,15 @@
   ],
   "external_models": [
     {
-      "model_id": "gpt-4o",
-      "provider": "openai_api",
-      "role": "teacher_or_evaluator",
-      "federated_trainable": false
+      "experiment_id": "qwen2_5_7b_centralized_baseline",
+      "model_id": "Qwen/Qwen2.5-7B-Instruct",
+      "provider": "huggingface_local",
+      "role": "centralized_baseline",
+      "method": "centralized_huggingface",
+      "architecture": "causal_lm",
+      "requires_cuda": true,
+      "federated_trainable": false,
+      "privacy_risk": 0.05
     }
   ]
 }

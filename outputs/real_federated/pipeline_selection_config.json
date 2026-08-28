@@ -1,8 +1,8 @@
 {
   "experiment": {
     "num_clients": 5,
-    "client_sampling_ratio": 1.0,
-    "local_epochs": 1,
+    "client_sampling_ratio": 0.6,
+    "local_epochs": 3,
     "batch_size": 4,
     "sequence_length": 128,
     "profiling_rounds": 3,
@@ -13,8 +13,8 @@
       44
     ],
     "aggregation": "FedAvg",
-    "target_quality": 0.4,
-    "max_rounds": 5,
+    "target_quality": 0.85,
+    "max_rounds": 20,
     "reference_utility": 0.9,
     "primary_metric": "accuracy",
     "output_dir": "outputs/real_federated",
@@ -36,6 +36,7 @@
     "minimum_validation_utility": 0.4,
     "maximum_privacy_risk": 0.5,
     "hospital_edge_required": false,
-    "public_cloud_allowed": false
+    "public_cloud_allowed": false,
+    "require_target_reached": false
   }
 }

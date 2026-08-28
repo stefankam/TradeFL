@@ -9,7 +9,7 @@ import math
 import sys
 import time
 from pathlib import Path
-
+from collections.abc import Callable
 import numpy as np
 import pandas as pd
 
@@ -17,6 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.obtain_data import ensure_dataset_available
 from tradefl.data import load_dataset_bundle
+from tradefl.backends.openai_baseline import evaluate_openai_baseline
+from tradefl.backends.huggingface_baseline import evaluate_huggingface_baseline
 from tradefl.federation.fedavg import iid_partition_indices, sample_weighted_fedavg
 from tradefl.federation.huggingface import (
     HuggingFaceClientTrainer,
@@ -24,8 +26,15 @@ from tradefl.federation.huggingface import (
     tensor_state_nbytes,
     unavailable_runtime_reason,
 )
+from tradefl.measurement.energy import EnergyMeter
+from tradefl.selection.feasibility import Constraints
+from tradefl.selection.normalization import Budgets
+from tradefl.selection.scoring import TradeFLWeights
+from tradefl.selection.selector import select_best, write_selection
 from tradefl.utils.config import load_yaml
 from tradefl.utils.seeds import set_seed
+from scripts.summarize_results import summarize_results
+from scripts.select_plan import entropy_weights
 
 
 def main() -> None:
@@ -33,6 +42,9 @@ def main() -> None:
     parser.add_argument("--experiment-config", default="configs/experiment_pubmedqa.yaml")
     parser.add_argument("--models-config", default="configs/real_federated_models.yaml")
     parser.add_argument("--output-dir", default="outputs/real_federated")
+    parser.add_argument("--budgets", default="configs/budgets.yaml")
+    parser.add_argument("--weights", default="configs/weights.yaml")
+    parser.add_argument("--weight-method", choices=["configured", "entropy"], default="configured")
     parser.add_argument("--experiment-id", action="append", help="Run only the selected experiment ID; repeatable.")
     parser.add_argument("--strict-hardware", action="store_true", help="Fail instead of skipping models unsupported by this host.")
     parser.add_argument(
@@ -40,12 +52,39 @@ def main() -> None:
         action="store_true",
         help="Run a short two-client, one-round, one-seed Bio_ClinicalBERT pipeline check on CPU.",
     )
+
+    parser.add_argument(
+        "--run-external-baselines",
+        action="store_true",
+        help="Evaluate configured centralized API baselines (may send dataset records to paid external APIs).",
+    )
+    parser.add_argument(
+        "--external-only",
+        action="store_true",
+        help="Skip every federated experiment and evaluate only configured centralized API baselines.",
+    )
+    parser.add_argument(
+        "--external-baseline-id",
+        action="append",
+        help="Run only the selected external baseline ID; repeatable and implies external baseline execution.",
+    )
+    parser.add_argument(
+        "--append-results",
+        action="store_true",
+        help="Merge an external-only result into an existing raw_metrics.csv without deleting federated round logs.",
+    )
     parser.add_argument(
         "--allow-slow-cpu",
         action="store_true",
         help="Allow the full Bio_ClinicalBERT study on CPU; it can take many hours or days.",
     )
+
     args = parser.parse_args()
+
+    if args.external_only and args.cpu_smoke_test:
+        parser.error("--external-only cannot be combined with --cpu-smoke-test")
+    if args.external_only and args.experiment_id:
+        parser.error("--external-only cannot be combined with --experiment-id")
 
     experiment_cfg = load_yaml(args.experiment_config)
     models_cfg = load_yaml(args.models_config)
@@ -61,6 +100,8 @@ def main() -> None:
     experiments = [
         item for item in models_cfg["federated_experiments"] if not selected or item["experiment_id"] in selected
     ]
+    if args.external_only:
+        experiments = []
     if args.cpu_smoke_test:
         experiments = [item for item in experiments if item["experiment_id"] == "bio_clinicalbert_baseline"]
     if selected - {item["experiment_id"] for item in experiments}:
@@ -69,9 +110,21 @@ def main() -> None:
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     round_path = output / "round_metrics.jsonl"
-    round_path.unlink(missing_ok=True)
-    summaries = []
-    skipped = []
+
+    raw_path = output / "raw_metrics.csv"
+    if args.append_results and not raw_path.exists():
+        raise SystemExit(f"Cannot append results because {raw_path} does not exist.")
+    if not args.append_results:
+        round_path.unlink(missing_ok=True)
+    summaries = pd.read_csv(raw_path).to_dict("records") if args.append_results else []
+    skipped_path = output / "skipped_experiments.json"
+    skipped = json.loads(skipped_path.read_text(encoding="utf-8")) if args.append_results and skipped_path.exists() else []
+    def publish(partial: dict | None = None) -> None:
+        rows = [*summaries, *([] if partial is None else [partial])]
+        if rows:
+            write_live_reports(rows, output, args, experiment_cfg, models_cfg)
+
+
     for model_config in experiments:
         unavailable = unavailable_runtime_reason(model_config, training)
         if unavailable:
@@ -82,20 +135,63 @@ def main() -> None:
             continue
         for seed in exp["seeds"]:
             try:
-                summaries.append(run_model_experiment(model_config, training, exp, dataset, seed, round_path))
+                summaries.append(
+                    run_model_experiment(
+                        model_config,
+                        training,
+                        exp,
+                        dataset,
+                        seed,
+                        round_path,
+                        on_round=publish,
+                    )
+                )
             except UnsupportedRuntimeError as exc:
                 if args.strict_hardware:
                     raise
                 skipped.append({"experiment_id": model_config["experiment_id"], "seed": seed, "reason": str(exc)})
                 print(f"SKIPPED {model_config['experiment_id']} seed={seed}: {exc}", file=sys.stderr)
                 break
-    (output / "skipped_experiments.json").write_text(json.dumps(skipped, indent=2) + "\n", encoding="utf-8")
+
+
+    if args.run_external_baselines or args.external_only or args.external_baseline_id:
+        external_models = models_cfg.get("external_models", [])
+        selected_external = set(args.external_baseline_id or [])
+        known_external = {str(item.get("experiment_id", item["model_id"])) for item in external_models}
+        if selected_external - known_external:
+            raise ValueError(f"Unknown external baseline IDs: {sorted(selected_external - known_external)}")
+        for model_config in external_models:
+            external_id = str(model_config.get("experiment_id", model_config["model_id"]))
+            if selected_external and external_id not in selected_external:
+                continue
+            if model_config.get("method") == "centralized_api":
+                row = evaluate_openai_baseline(
+                    model_config,
+                    dataset.validation,
+                    dataset.test,
+                    dataset.labels,
+                )
+            elif model_config.get("method") == "centralized_huggingface":
+                row = evaluate_huggingface_baseline(model_config, dataset, training)
+            else:
+                continue
+            row["accuracy_loss"] = max(
+                0.0,
+                float(exp.get("reference_utility", 1.0)) - float(row["validation_utility"]),
+            )
+            row["target_reached"] = row["validation_utility"] >= float(exp["target_quality"])
+            summaries[:] = [existing for existing in summaries if str(existing.get("plan_id")) != external_id]
+            summaries.append(row)
+            publish()
+    skipped_path.write_text(json.dumps(skipped, indent=2) + "\n", encoding="utf-8")
     if not summaries:
         raise SystemExit(
             "No selected experiment can run with these hardware settings. On CPU use --cpu-smoke-test; "
             "for the full study use CUDA (or explicitly acknowledge a very slow BERT run with --allow-slow-cpu)."
         )
-    pd.DataFrame(summaries).to_csv(output / "raw_metrics.csv", index=False)
+    publish()
+
+
 
 
 def apply_cpu_smoke_profile(experiment_cfg: dict, training: dict) -> tuple[dict, dict]:
@@ -124,7 +220,15 @@ def apply_cpu_smoke_profile(experiment_cfg: dict, training: dict) -> tuple[dict,
     return experiment_cfg, training
 
 
-def run_model_experiment(model_config, training, exp, dataset, seed, round_path: Path) -> dict:
+def run_model_experiment(
+    model_config,
+    training,
+    exp,
+    dataset,
+    seed,
+    round_path: Path,
+    on_round: Callable[[dict], None] | None = None,
+) -> dict:
     """Run all federated rounds for one base-model architecture and seed."""
 
     set_seed(seed)
@@ -141,6 +245,8 @@ def run_model_experiment(model_config, training, exp, dataset, seed, round_path:
     clients_per_round = min(num_clients, clients_per_round)
 
     for round_index in range(int(exp["max_rounds"])):
+        energy_meter = EnergyMeter()
+        energy_meter.start()
         selected_clients = sorted(rng.choice(num_clients, size=clients_per_round, replace=False).tolist())
         downloads = tensor_state_nbytes(global_state) * len(selected_clients)
         updates = []
@@ -170,6 +276,7 @@ def run_model_experiment(model_config, training, exp, dataset, seed, round_path:
         validation = trainer.evaluate(dataset.validation, global_state)
         test = trainer.evaluate(dataset.test, global_state)
         latency = time.perf_counter() - round_started
+        energy_joules = energy_meter.stop()
         row = {
             "plan_id": model_config["experiment_id"],
             "model_id": model_config["model_id"],
@@ -188,6 +295,7 @@ def run_model_experiment(model_config, training, exp, dataset, seed, round_path:
             "test_utility": test[exp.get("primary_metric", "accuracy")],
             "test_macro_f1": test["macro_f1"],
             "privacy_risk": float(model_config.get("privacy_risk", 0.25)),
+            "energy_joules": energy_joules,
             "training_mode": "real_federated",
             "aggregation": "FedAvg",
         }
@@ -198,6 +306,17 @@ def run_model_experiment(model_config, training, exp, dataset, seed, round_path:
             target_reached = True
             rounds_to_target = round_index + 1
             break
+        partial_summary = summarize_model_run(model_config, exp, dataset.name, seed, rounds, target_reached, rounds_to_target)
+        if on_round is not None:
+            on_round(partial_summary)
+        if target_reached:
+            break
+
+    return summarize_model_run(model_config, exp, dataset.name, seed, rounds, target_reached, rounds_to_target)
+
+
+def summarize_model_run(model_config, exp, dataset_name, seed, rounds, target_reached, rounds_to_target) -> dict:
+    """Build a CSV-ready summary for a completed or in-progress model run."""
 
     final = rounds[-1]
     return {
@@ -205,7 +324,7 @@ def run_model_experiment(model_config, training, exp, dataset, seed, round_path:
         "model_id": model_config["model_id"],
         "method": model_config.get("method", "full_finetuning"),
         "seed": seed,
-        "dataset": dataset.name,
+        "dataset": dataset_name,
         "training_mode": "real_federated",
         "aggregation": "FedAvg",
         "validation_utility": final["validation_utility"],
@@ -222,8 +341,54 @@ def run_model_experiment(model_config, training, exp, dataset, seed, round_path:
         "latency_to_target_seconds": sum(row["latency_seconds"] for row in rounds),
         "mean_round_latency_seconds": sum(row["latency_seconds"] for row in rounds) / len(rounds),
         "privacy_risk": final["privacy_risk"],
-        "energy_to_target_joules": None,
+        "energy_to_target_joules": (
+            sum(float(row["energy_joules"]) for row in rounds)
+            if all(row["energy_joules"] is not None for row in rounds)
+            else None
+        ),
     }
+
+
+
+def write_live_reports(rows, output: Path, args, experiment_cfg, models_cfg) -> None:
+    """Atomically refresh raw metrics, selection artifacts, summaries, and graphs."""
+
+    raw_path = output / "raw_metrics.csv"
+    temporary_raw = output / ".raw_metrics.csv.tmp"
+    pd.DataFrame(rows).to_csv(temporary_raw, index=False)
+    temporary_raw.replace(raw_path)
+
+    budget_cfg = load_yaml(args.budgets)
+    weight_cfg = load_yaml(args.weights)
+    if "budgets" not in budget_cfg or "scenarios" not in weight_cfg or "constraints" not in experiment_cfg:
+        pd.DataFrame(rows).to_csv(output / "plan_summary.csv", index=False)
+        return
+    scenario = weight_cfg.get("default_scenario", "equal")
+    weights = TradeFLWeights(**weight_cfg["scenarios"][scenario])
+    if getattr(args, "weight_method", "configured") == "entropy":
+        weights = entropy_weights(rows, budget_cfg.get("enabled_metrics", {}), weights)
+    result = select_best(
+        rows,
+        Budgets(**budget_cfg["budgets"]),
+        weights,
+        Constraints(**experiment_cfg["constraints"]),
+        budget_cfg.get("enabled_metrics", {}),
+        experiment_cfg["experiment"].get("reference_utility", 1.0),
+    )
+    write_selection(result, output)
+    expected_ids = [item["experiment_id"] for item in models_cfg["federated_experiments"]]
+    expected_status = {plan_id: "not_run" for plan_id in expected_ids}
+    for item in models_cfg.get("external_models", []):
+        plan_id = str(item.get("experiment_id", item["model_id"]))
+        expected_ids.append(plan_id)
+        expected_status[plan_id] = "external_not_federated"
+    summarize_results(
+        output / "plan_summary.csv",
+        output / "summary",
+        expected_plan_ids=expected_ids,
+        expected_status=expected_status,
+    )
+
 
 
 if __name__ == "__main__":

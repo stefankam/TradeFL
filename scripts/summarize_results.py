@@ -76,7 +76,7 @@ def main() -> None:
         expected_plan_ids = [item["experiment_id"] for item in model_config["federated_experiments"]]
         expected_status = {plan_id: "not_run" for plan_id in expected_plan_ids}
         for item in model_config.get("external_models", []):
-            model_id = str(item["model_id"])
+            model_id = str(item.get("experiment_id", item["model_id"]))
             expected_plan_ids.append(model_id)
             expected_status[model_id] = "external_not_federated"
     summarize_results(
@@ -96,15 +96,18 @@ def summarize_results(
     """Write graphs only from results proven to come from real federated training."""
 
     df = pd.read_csv(input_path)
-    required_mode = "real_federated"
+    allowed_modes = {"real_federated", "centralized_api", "centralized_local"}
     if "training_mode" not in df.columns:
         raise ValueError(
-            "Input CSV must include training_mode='real_federated'; "
+            "Input CSV must include training_mode='real_federated' or a recognized centralized mode; "
             "reference-model graphs are intentionally disabled."
         )
-    unexpected = sorted(set(df["training_mode"].dropna().astype(str)) - {required_mode})
+    unexpected = sorted(set(df["training_mode"].dropna().astype(str)) - allowed_modes)
     if unexpected or df["training_mode"].isna().any():
-        raise ValueError(f"Only training_mode='real_federated' can be graphed; found {unexpected or ['<missing>']}")
+        raise ValueError(
+            "Only real_federated, centralized_api, or centralized_local results can be graphed; "
+            f"found {unexpected or ['<missing>']}"
+        )
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
     summary = summarize_frame(df)
     if expected_plan_ids:

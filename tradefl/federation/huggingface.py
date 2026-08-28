@@ -212,6 +212,29 @@ class HuggingFaceClientTrainer:
             f1s.append(2 * precision * recall / (precision + recall) if precision + recall else 0.0)
         return {"accuracy": accuracy, "macro_f1": sum(f1s) / len(f1s)}
 
+
+    def evaluate_centralized_splits(
+        self, validation: list[DatasetRecord], test: list[DatasetRecord]
+    ) -> dict[str, dict[str, float] | int]:
+        """Load once and evaluate an unchanged local model on both held-out splits."""
+
+        model, tokenizer = self._load_model_and_tokenizer()
+        model.eval()
+        if self.torch.cuda.is_available():
+            self.torch.cuda.reset_peak_memory_stats()
+        evaluator = self._evaluate_classifier if self.model_config["architecture"] == "sequence_classification" else self._evaluate_causal_lm
+        validation_predictions = evaluator(model, tokenizer, validation)
+        test_predictions = evaluator(model, tokenizer, test)
+        peak = int(self.torch.cuda.max_memory_allocated()) if self.torch.cuda.is_available() else 0
+        result = {
+            "validation": _classification_metrics(validation_predictions, validation, self.labels),
+            "test": _classification_metrics(test_predictions, test, self.labels),
+            "peak_memory_bytes": peak,
+        }
+        self._release(model)
+        return result
+
+
     def _load_model_and_tokenizer(self):
         runtime = self._resolved_runtime()
         model_id = self.model_config["model_id"]
@@ -324,6 +347,21 @@ def tensor_state_nbytes(state: dict[str, np.ndarray]) -> int:
     """Return actual serialized tensor payload size before transport framing."""
 
     return sum(array.nbytes for array in state.values())
+
+
+def _classification_metrics(predictions, records, labels) -> dict[str, float]:
+    correct = sum(prediction == record.label for prediction, record in zip(predictions, records))
+    accuracy = correct / len(records)
+    f1s = []
+    for label in labels:
+        tp = sum(pred == label and row.label == label for pred, row in zip(predictions, records))
+        fp = sum(pred == label and row.label != label for pred, row in zip(predictions, records))
+        fn = sum(pred != label and row.label == label for pred, row in zip(predictions, records))
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1s.append(2 * precision * recall / (precision + recall) if precision + recall else 0.0)
+    return {"accuracy": accuracy, "macro_f1": sum(f1s) / len(f1s)}
+
 
 
 def translate_backend_exception(exc: Exception, phase: str) -> UnsupportedRuntimeError | None:

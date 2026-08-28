@@ -32,6 +32,18 @@ def selection_api_version() -> int:
     return int(getattr(_load_sibling_select_plan(), "SELECT_PLAN_API_VERSION", 1))
 
 
+def validate_component_versions() -> None:
+    """Fail before training when selection cannot honor the pipeline contract."""
+
+    version = selection_api_version()
+    if version < 3:
+        raise SystemExit(
+            "Pipeline selection requires --output-dir and --weight-method support. "
+            "Update the whole repository so scripts/select_plan.py exposes API v3."
+        )
+
+
+
 def materialize_selection_config(experiment_config: str, output_dir: str) -> Path:
     """Write a compatibility config whose selection output matches the pipeline."""
 
@@ -62,6 +74,12 @@ def pipeline_commands(args: argparse.Namespace, select_api: int = 3) -> list[lis
             args.models_config,
             "--output-dir",
             str(output),
+            "--budgets",
+            args.budgets,
+            "--weights",
+            args.weights,
+            "--weight-method",
+            args.weight_method,
         ]
         for experiment_id in args.experiment_id or []:
             training.extend(["--experiment-id", experiment_id])
@@ -71,6 +89,14 @@ def pipeline_commands(args: argparse.Namespace, select_api: int = 3) -> list[lis
             training.append("--allow-slow-cpu")
         if args.strict_hardware:
             training.append("--strict-hardware")
+        if getattr(args, "run_external_baselines", False):
+            training.append("--run-external-baselines")
+        if getattr(args, "external_only", False):
+            training.append("--external-only")
+        for external_id in getattr(args, "external_baseline_id", None) or []:
+            training.extend(["--external-baseline-id", external_id])
+        if getattr(args, "append_results", False):
+            training.append("--append-results")
         commands.append(training)
     selection = [
                 python,
@@ -123,9 +149,27 @@ def main() -> None:
     parser.add_argument("--cpu-smoke-test", action="store_true")
     parser.add_argument("--allow-slow-cpu", action="store_true")
     parser.add_argument("--strict-hardware", action="store_true")
+    parser.add_argument(
+        "--run-external-baselines",
+        action="store_true",
+        help="Run configured paid centralized API baselines after federated training.",
+    )
+    parser.add_argument(
+        "--external-only",
+        action="store_true",
+        help="Skip federated training and run only configured centralized API baselines.",
+    )
+
+    parser.add_argument("--external-baseline-id", action="append")
+    parser.add_argument(
+        "--append-results",
+        action="store_true",
+        help="Add an external-only baseline to existing metrics and preserve federated round logs.",
+    )
     parser.add_argument("--skip-training", action="store_true", help="Select and graph an existing raw_metrics.csv.")
     args = parser.parse_args()
 
+    validate_component_versions()
     select_api = selection_api_version()
     args.selection_config = str(materialize_selection_config(args.experiment_config, args.output_dir))
     if select_api < 3:
