@@ -2,8 +2,8 @@
   "experiment": {
     "num_clients": 5,
     "client_sampling_ratio": 0.6,
-    "local_epochs": 3,
-    "batch_size": 4,
+    "local_epochs": 1,
+    "batch_size": 64,
     "sequence_length": 128,
     "profiling_rounds": 3,
     "repetitions": 3,
@@ -13,7 +13,7 @@
       44
     ],
     "aggregation": "FedAvg",
-    "target_quality": 0.85,
+    "target_quality": 0.7,
     "max_rounds": 20,
     "reference_utility": 0.9,
     "primary_metric": "accuracy",

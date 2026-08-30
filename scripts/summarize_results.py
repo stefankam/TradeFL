@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path as _Path
 
 sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
@@ -14,7 +15,28 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from pathlib import Path
 
+
+from tradefl.scheduling import replay_schedulers
 from tradefl.utils.config import load_yaml
+
+
+
+plt.rcParams.update(
+    {
+        "font.size": 14,
+        "axes.titlesize": 20,
+        "axes.labelsize": 16,
+        "xtick.labelsize": 13,
+        "ytick.labelsize": 13,
+        "legend.fontsize": 13,
+        "figure.titlesize": 22,
+    }
+)
+
+ANNOTATION_FONT_SIZE = 11
+PARETO_ANNOTATION_FONT_SIZE = 16
+
+
 
 GRAPH_SPECS = [
     ("01_tradefl_score_by_plan.pdf", "tradefl_score", "Deployment-specific TradeFL score by plan", "TradeFL score", "bar"),
@@ -63,11 +85,25 @@ SUMMARY_AGGREGATIONS = {
 SUMMARIZE_RESULTS_API_VERSION = 3
 
 
+SCHEDULER_GRAPH_SPECS = [
+    ("20_scheduler_overall_task_utility.pdf", "overall_task_utility", "Overall task utility", "Mean test utility"),
+    ("21_scheduler_deadline_violation_rate.pdf", "deadline_slo_violation_rate", "Deadline/SLO violation rate", "Violation rate"),
+    ("22_scheduler_resource_violation_rate.pdf", "memory_resource_violation_rate", "Memory/resource violation rate", "Violation rate"),
+    ("23_scheduler_communication_cost.pdf", "communication_cost_bytes", "Communication cost", "Mean bytes per decision"),
+    ("24_scheduler_energy_consumption.pdf", "energy_consumption_joules", "Energy consumption", "Mean joules per decision"),
+    ("25_scheduler_time_to_target.pdf", "time_to_target_seconds", "Time to target / observation horizon", "Mean seconds (hatched = censored)"),
+    ("26_scheduler_scheduling_overhead.pdf", "scheduling_overhead_microseconds", "Scheduling overhead", "Mean microseconds per decision"),
+    ("27_scheduler_target_attainment_rate.pdf", "target_attainment_rate", "Target attainment rate", "Attainment rate"),
+]
+
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--models-config", help="Show every configured real plan, marking plans without results N/A.")
+    parser.add_argument("--config", help="Experiment config supplying replay resource and SLO constraints.")
     args = parser.parse_args()
     expected_plan_ids = None
     expected_status = None
@@ -84,6 +120,7 @@ def main() -> None:
         Path(args.output),
         expected_plan_ids=expected_plan_ids,
         expected_status=expected_status,
+        constraints=load_yaml(args.config).get("constraints", {}) if args.config else None,
     )
 
 
@@ -92,6 +129,7 @@ def summarize_results(
     output_prefix: Path,
     expected_plan_ids: list[str] | None = None,
     expected_status: dict[str, str] | None = None,
+    constraints: dict | None = None,
 ) -> None:
     """Write graphs only from results proven to come from real federated training."""
 
@@ -133,6 +171,7 @@ def summarize_results(
             _pareto_plot(summary, tradeoff, x, y, xlabel, ylabel, x_direction, y_direction, x_scale, y_scale, path)
         )
         written.append(path)
+    written.extend(write_scheduler_replay_graphs(df, graph_dir, constraints or {}))
     invalid_graphs = [path for path in written if not path.exists() or path.stat().st_size == 0]
     if invalid_graphs:
         raise RuntimeError(f"Graph generation did not produce valid PDFs: {[str(path) for path in invalid_graphs]}")
@@ -152,6 +191,67 @@ def summarize_frame(df: pd.DataFrame) -> pd.DataFrame:
     if not aggregations:
         return df[["plan_id"]].drop_duplicates().sort_values("plan_id")
     return df.groupby("plan_id", as_index=False).agg(aggregations)
+
+
+
+def write_scheduler_replay_graphs(df: pd.DataFrame, graph_dir: Path, constraints: dict) -> list[Path]:
+    """Render and persist outputs from scheduling policies owned by tradefl.scheduling."""
+
+    replay = replay_schedulers(df, constraints)
+    if replay is None:
+        return []
+    replay.decisions.to_csv(graph_dir / "scheduler_replay_decisions.csv", index=False)
+    replay.outcomes.to_csv(graph_dir / "scheduler_comparison.csv", index=False)
+    replay.price_trace.to_csv(graph_dir / "scheduler_shadow_price_trace.csv", index=False)
+    replay.definitions.to_csv(graph_dir / "scheduler_definitions.csv", index=False)
+    written = []
+    for filename, metric, title, ylabel in SCHEDULER_GRAPH_SPECS:
+        path = graph_dir / filename
+        _scheduler_bar_plot(replay.outcomes, metric, title, ylabel, path)
+        written.append(path)
+    return written
+
+
+def _scheduler_bar_plot(outcomes: pd.DataFrame, metric: str, title: str, ylabel: str, path: Path) -> None:
+    fig, ax = plt.subplots(figsize=(14, 8))
+    values = pd.to_numeric(outcomes[metric], errors="coerce")
+    bars = ax.bar(outcomes["scheduler"], values.fillna(0.0), color="tab:purple")
+    finite_values = values.dropna()
+    label_offset = max(float(finite_values.max()) * 0.015, 0.01) if not finite_values.empty else 0.01
+    for bar, value, missing in zip(bars, values, values.isna()):
+        if missing:
+            bar.set_hatch("//")
+            ax.annotate(
+                "N/A", (bar.get_x() + bar.get_width() / 2, 0),
+                ha="center", va="bottom", fontsize=ANNOTATION_FONT_SIZE,
+            )
+        else:
+            if value == 0:
+                ax.scatter([bar.get_x() + bar.get_width() / 2], [0], marker="_", s=180, color="black", zorder=3)
+            ax.annotate(
+                f"{value:.3g}",
+                (bar.get_x() + bar.get_width() / 2, max(float(value), 0) + label_offset),
+                ha="center", va="bottom", fontsize=ANNOTATION_FONT_SIZE,
+            )
+    if metric == "time_to_target_seconds" and "time_to_target_censoring_rate" in outcomes:
+        for bar, rate in zip(bars, pd.to_numeric(outcomes["time_to_target_censoring_rate"], errors="coerce")):
+            if pd.notna(rate) and rate > 0:
+                bar.set_hatch("//")
+                ax.annotate(
+                    f"{rate:.0%} censored", (bar.get_x() + bar.get_width() / 2, bar.get_height() / 2),
+                    ha="center", va="center", rotation=90, fontsize=ANNOTATION_FONT_SIZE,
+                )
+    if metric.endswith("_rate"):
+        ax.set_ylim(0, 1.08)
+    ax.set_title(f"Scheduler replay: {title}")
+    ax.set_ylabel(ylabel)
+    ax.tick_params(axis="x", rotation=30)
+    fig.tight_layout()
+    fig.savefig(path, format="pdf")
+    plt.close(fig)
+
+
+
 
 
 def write_pdf_graphs(df: pd.DataFrame, summary: pd.DataFrame, graph_dir: Path) -> list[Path]:
@@ -216,11 +316,11 @@ def _raw_value_table_plot(summary: pd.DataFrame, path: Path) -> None:
         if column != "plan_id":
             table[column] = pd.to_numeric(table[column], errors="coerce").map(lambda value: "N/A" if pd.isna(value) else f"{value:.4g}")
     table = table.rename(columns=rename)
-    fig, ax = plt.subplots(figsize=(16, max(3.5, 0.55 * len(table) + 2)))
+    fig, ax = plt.subplots(figsize=(18, max(5.0, 0.72 * len(table) + 2.5)))
     ax.axis("off")
     ax.set_title("Raw mean values by model plan (N/A = not measured)", pad=16)
     ax.table(cellText=table.values, colLabels=table.columns, loc="center", cellLoc="center").auto_set_font_size(False)
-    fig.axes[0].tables[0].set_fontsize(7)
+    fig.axes[0].tables[0].set_fontsize(10)
     fig.tight_layout()
     fig.savefig(path, format="pdf")
     plt.close(fig)
@@ -233,7 +333,7 @@ def _resource_comparison_plot(summary: pd.DataFrame, path: Path) -> None:
         ("compute_to_target_seconds", "Compute time to target (seconds)", 1.0),
         ("latency_to_target_seconds", "Latency to target (seconds)", 1.0),
     ]
-    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    fig, axes = plt.subplots(2, 2, figsize=(18, 12))
     for ax, (metric, title, scale) in zip(axes.flat, specs):
         values = pd.to_numeric(summary.get(metric, pd.Series(float("nan"), index=summary.index)), errors="coerce") / scale
         missing = values.isna()
@@ -241,9 +341,12 @@ def _resource_comparison_plot(summary: pd.DataFrame, path: Path) -> None:
         for bar, is_missing in zip(bars, missing):
             if is_missing:
                 bar.set_hatch("//")
-                ax.annotate("N/A", (bar.get_x() + bar.get_width() / 2, 0), ha="center", va="bottom", fontsize=7)
+                ax.annotate(
+                    "N/A", (bar.get_x() + bar.get_width() / 2, 0),
+                    ha="center", va="bottom", fontsize=ANNOTATION_FONT_SIZE,
+                )
         ax.set_title(title)
-        ax.tick_params(axis="x", rotation=35, labelsize=7)
+        ax.tick_params(axis="x", rotation=35, labelsize=11)
     fig.suptitle("LLaMA, DeepSeek, and Bio_ClinicalBERT resource comparison")
     fig.tight_layout()
     fig.savefig(path, format="pdf")
@@ -280,7 +383,7 @@ def pareto_classification(frame: pd.DataFrame, x: str, y: str, x_direction: str,
 
 def _pareto_plot(summary, tradeoff, x, y, xlabel, ylabel, x_direction, y_direction, x_scale, y_scale, path):
     classification = pareto_classification(summary, x, y, x_direction, y_direction)
-    fig, ax = plt.subplots(figsize=(10, 7))
+    fig, ax = plt.subplots(figsize=(13, 9))
     rows = []
     for _, row in summary.iterrows():
         plan_id = str(row["plan_id"])
@@ -292,7 +395,14 @@ def _pareto_plot(summary, tradeoff, x, y, xlabel, ylabel, x_direction, y_directi
             continue
         marker, color = (("x", "tab:red") if status == "dominated" else ("o", "tab:green"))
         ax.scatter(x_value / x_scale, y_value / y_scale, marker=marker, color=color, s=75, label=status)
-        ax.annotate(plan_id, (x_value / x_scale, y_value / y_scale), fontsize=7, xytext=(4, 4), textcoords="offset points")
+        ax.annotate(
+            plan_id,
+            (x_value / x_scale, y_value / y_scale),
+            fontsize=PARETO_ANNOTATION_FONT_SIZE,
+            fontweight="bold",
+            xytext=(7, 7),
+            textcoords="offset points",
+        )
     handles, labels = ax.get_legend_handles_labels()
     unique = dict(zip(labels, handles))
     if unique:
@@ -303,7 +413,10 @@ def _pareto_plot(summary, tradeoff, x, y, xlabel, ylabel, x_direction, y_directi
         _no_data(ax, f"No plans have both {x} and {y}")
     missing = [plan_id for plan_id, (status, _) in classification.items() if status == "not_available"]
     if missing:
-        ax.text(0.01, 0.01, "N/A: " + ", ".join(missing), transform=ax.transAxes, fontsize=7, va="bottom")
+        ax.text(
+            0.01, 0.01, "N/A: " + ", ".join(missing),
+            transform=ax.transAxes, fontsize=14, fontweight="bold", va="bottom",
+        )
     ax.set_title(f"Pareto view: {tradeoff.replace('_', ' ')}")
     fig.tight_layout()
     fig.savefig(path, format="pdf")
@@ -312,7 +425,7 @@ def _pareto_plot(summary, tradeoff, x, y, xlabel, ylabel, x_direction, y_directi
 
 
 def _bar_plot(summary: pd.DataFrame, metric: str, title: str, ylabel: str, path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(10, 5.5))
+    fig, ax = plt.subplots(figsize=(13, 7.5))
     if metric in summary.columns and not summary.empty:
         columns = ["plan_id", metric] + [column for column in ("observed", "status") if column in summary.columns]
         plot_data = summary[columns].copy()
@@ -332,7 +445,10 @@ def _bar_plot(summary: pd.DataFrame, metric: str, title: str, ylabel: str, path:
                 bar.set_hatch("//")
                 status = plot_data.iloc[index].get("status", "not_run")
                 label = "N/A\nexternal" if status == "external_not_federated" else "N/A\nnot run"
-                ax.annotate(label, (bar.get_x() + bar.get_width() / 2, 0), ha="center", va="bottom", fontsize=8)
+                ax.annotate(
+                    label, (bar.get_x() + bar.get_width() / 2, 0),
+                    ha="center", va="bottom", fontsize=ANNOTATION_FONT_SIZE,
+                )
         ax.set_ylabel(ylabel)
         ax.tick_params(axis="x", rotation=35)
     else:
@@ -346,7 +462,7 @@ def _bar_plot(summary: pd.DataFrame, metric: str, title: str, ylabel: str, path:
 def _quality_plot(summary: pd.DataFrame, title: str, path: Path) -> None:
     """Compare validation and test utility across local and external model roles."""
 
-    fig, ax = plt.subplots(figsize=(12, 6.5))
+    fig, ax = plt.subplots(figsize=(14, 8))
     positions = list(range(len(summary)))
     validation = pd.to_numeric(
         summary["validation_utility"] if "validation_utility" in summary else pd.Series(float("nan"), index=summary.index),
@@ -363,7 +479,7 @@ def _quality_plot(summary: pd.DataFrame, title: str, path: Path) -> None:
     for position, state in zip(positions, status):
         if state != "completed":
             label = "external API\nnot FedAvg" if state == "external_not_federated" else "N/A\nnot run"
-            ax.annotate(label, (position, 0), ha="center", va="bottom", fontsize=8)
+            ax.annotate(label, (position, 0), ha="center", va="bottom", fontsize=ANNOTATION_FONT_SIZE)
     ax.set_xticks(positions, summary["plan_id"].astype(str), rotation=35, ha="right")
     ax.set_ylabel("Utility")
     ax.set_title(title)
@@ -374,7 +490,7 @@ def _quality_plot(summary: pd.DataFrame, title: str, path: Path) -> None:
 
 
 def _scatter_plot(df: pd.DataFrame, x: str, y: str, title: str, xlabel: str, ylabel: str, path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, ax = plt.subplots(figsize=(11, 8))
     if x in df.columns and y in df.columns and not df.empty:
         ax.scatter(pd.to_numeric(df[x], errors="coerce"), pd.to_numeric(df[y], errors="coerce"))
         if "plan_id" in df.columns:
@@ -382,7 +498,10 @@ def _scatter_plot(df: pd.DataFrame, x: str, y: str, title: str, xlabel: str, yla
                 x_value = pd.to_numeric(pd.Series([row[x]]), errors="coerce").iloc[0]
                 y_value = pd.to_numeric(pd.Series([row[y]]), errors="coerce").iloc[0]
                 if pd.notna(x_value) and pd.notna(y_value):
-                    ax.annotate(str(row["plan_id"]), (x_value, y_value), fontsize=7, alpha=0.75)
+                    ax.annotate(
+                        str(row["plan_id"]), (x_value, y_value),
+                        fontsize=ANNOTATION_FONT_SIZE, alpha=0.85,
+                    )
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
     else:

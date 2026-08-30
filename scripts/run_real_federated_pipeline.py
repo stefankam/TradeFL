@@ -131,6 +131,8 @@ def pipeline_commands(args: argparse.Namespace, select_api: int = 3) -> list[lis
                 str(output / "summary"),
                 "--models-config",
                 args.models_config,
+                "--config",
+                str(getattr(args, "selection_config", args.experiment_config)),
             ],
         ]
     )

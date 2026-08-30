@@ -243,6 +243,13 @@ def run_model_experiment(
     rng = np.random.default_rng(seed)
     clients_per_round = max(2, math.ceil(num_clients * float(exp.get("client_sampling_ratio", 1.0))))
     clients_per_round = min(num_clients, clients_per_round)
+    shadow_config = exp.get("shadow_pricing", {})
+    shadow_scheduler = (
+        ShadowPriceScheduler(num_clients, clients_per_round, shadow_config, seed)
+        if shadow_config.get("enabled", False)
+        else None
+    )
+
 
     for round_index in range(int(exp["max_rounds"])):
         energy_meter = EnergyMeter()
