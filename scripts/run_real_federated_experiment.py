@@ -27,6 +27,7 @@ from tradefl.federation.huggingface import (
     unavailable_runtime_reason,
 )
 from tradefl.measurement.energy import EnergyMeter
+from tradefl.scheduling import ONLINE_POLICIES, ShadowPriceScheduler, build_online_scheduler
 from tradefl.selection.feasibility import Constraints
 from tradefl.selection.normalization import Budgets
 from tradefl.selection.scoring import TradeFLWeights
@@ -35,6 +36,7 @@ from tradefl.utils.config import load_yaml
 from tradefl.utils.seeds import set_seed
 from scripts.summarize_results import summarize_results
 from scripts.select_plan import entropy_weights
+
 
 
 def main() -> None:
@@ -46,6 +48,10 @@ def main() -> None:
     parser.add_argument("--weights", default="configs/weights.yaml")
     parser.add_argument("--weight-method", choices=["configured", "entropy"], default="configured")
     parser.add_argument("--experiment-id", action="append", help="Run only the selected experiment ID; repeatable.")
+    parser.add_argument(
+        "--scheduler-policy", action="append", choices=ONLINE_POLICIES,
+        help="Run only this online scheduling treatment; repeatable.",
+    )
     parser.add_argument("--strict-hardware", action="store_true", help="Fail instead of skipping models unsupported by this host.")
     parser.add_argument(
         "--cpu-smoke-test",
@@ -133,27 +139,36 @@ def main() -> None:
             skipped.append({"experiment_id": model_config["experiment_id"], "seed": None, "reason": unavailable})
             print(f"SKIPPED {model_config['experiment_id']}: {unavailable}", file=sys.stderr)
             continue
-        for seed in exp["seeds"]:
-            try:
-                summaries.append(
-                    run_model_experiment(
-                        model_config,
-                        training,
-                        exp,
-                        dataset,
-                        seed,
-                        round_path,
-                        on_round=publish,
+
+        treatments = scheduler_treatments(exp, args.scheduler_policy)
+        for policy in treatments:
+            treatment_config = copy.deepcopy(model_config)
+            treatment_config["base_experiment_id"] = model_config["experiment_id"]
+            treatment_config["scheduler_policy"] = policy
+            treatment_config["experiment_id"] = (
+                f"{model_config['experiment_id']}__{policy}" if policy is not None else model_config["experiment_id"]
+            )
+            for seed in exp["seeds"]:
+                try:
+                    summaries.append(
+                        run_model_experiment(
+                            treatment_config,
+                            training,
+                            exp,
+                            dataset,
+                            seed,
+                            round_path,
+                            on_round=publish,
+                            scheduling_policy=policy,
+                            constraints=experiment_cfg.get("constraints", {}),
+                        )
                     )
-                )
-            except UnsupportedRuntimeError as exc:
-                if args.strict_hardware:
-                    raise
-                skipped.append({"experiment_id": model_config["experiment_id"], "seed": seed, "reason": str(exc)})
-                print(f"SKIPPED {model_config['experiment_id']} seed={seed}: {exc}", file=sys.stderr)
-                break
-
-
+                except UnsupportedRuntimeError as exc:
+                    if args.strict_hardware:
+                        raise
+                    skipped.append({"experiment_id": treatment_config["experiment_id"], "seed": seed, "reason": str(exc)})
+                    print(f"SKIPPED {treatment_config['experiment_id']} seed={seed}: {exc}", file=sys.stderr)
+                    break
     if args.run_external_baselines or args.external_only or args.external_baseline_id:
         external_models = models_cfg.get("external_models", [])
         selected_external = set(args.external_baseline_id or [])
@@ -180,6 +195,9 @@ def main() -> None:
                 float(exp.get("reference_utility", 1.0)) - float(row["validation_utility"]),
             )
             row["target_reached"] = row["validation_utility"] >= float(exp["target_quality"])
+            row["target_quality"] = float(exp["target_quality"])
+            row["constraint_provenance"] = json.dumps(experiment_cfg.get("constraints", {}), sort_keys=True)
+            row["scheduler_policy"] = "centralized_baseline"
             summaries[:] = [existing for existing in summaries if str(existing.get("plan_id")) != external_id]
             summaries.append(row)
             publish()
@@ -204,6 +222,7 @@ def apply_cpu_smoke_profile(experiment_cfg: dict, training: dict) -> tuple[dict,
             "client_sampling_ratio": 1.0,
             "max_rounds": 1,
             "seeds": [experiment_cfg["experiment"]["seeds"][0]],
+            "scheduler_treatments": ["tradefl_dynamic"],
         }
     )
     training = {
@@ -220,6 +239,21 @@ def apply_cpu_smoke_profile(experiment_cfg: dict, training: dict) -> tuple[dict,
     return experiment_cfg, training
 
 
+def scheduler_treatments(exp: dict, selected: list[str] | None = None) -> list[str | None]:
+    """Return validated online treatments in deterministic configured order."""
+
+    if "scheduler_treatments" not in exp:
+        return [None]
+    configured = list(exp["scheduler_treatments"])
+    unknown = set(configured) - set(ONLINE_POLICIES)
+    if unknown:
+        raise ValueError(f"Unknown scheduler treatments: {sorted(unknown)}")
+    requested = set(selected or [])
+    if requested - set(configured):
+        raise ValueError(f"Requested scheduler policies are not configured: {sorted(requested - set(configured))}")
+    return [policy for policy in configured if not requested or policy in requested]
+
+
 def run_model_experiment(
     model_config,
     training,
@@ -228,6 +262,8 @@ def run_model_experiment(
     seed,
     round_path: Path,
     on_round: Callable[[dict], None] | None = None,
+    scheduling_policy: str | None = None,
+    constraints: dict | None = None,
 ) -> dict:
     """Run all federated rounds for one base-model architecture and seed."""
 
@@ -244,22 +280,31 @@ def run_model_experiment(
     clients_per_round = max(2, math.ceil(num_clients * float(exp.get("client_sampling_ratio", 1.0))))
     clients_per_round = min(num_clients, clients_per_round)
     shadow_config = exp.get("shadow_pricing", {})
-    shadow_scheduler = (
-        ShadowPriceScheduler(num_clients, clients_per_round, shadow_config, seed)
-        if shadow_config.get("enabled", False)
-        else None
-    )
+    client_utilities = {client: float(len(records)) for client, records in enumerate(client_records)}
+    shadow_scheduler = None
+    if scheduling_policy is not None:
+        shadow_scheduler = build_online_scheduler(
+            scheduling_policy, num_clients, clients_per_round, shadow_config, seed, client_utilities,
+        )
+    elif shadow_config.get("enabled", False):
+        shadow_scheduler = ShadowPriceScheduler(num_clients, clients_per_round, shadow_config, seed)
+        scheduling_policy = "tradefl_dynamic"
 
 
     for round_index in range(int(exp["max_rounds"])):
         energy_meter = EnergyMeter()
         energy_meter.start()
-        selected_clients = sorted(rng.choice(num_clients, size=clients_per_round, replace=False).tolist())
+        if shadow_scheduler is None:
+            selected_clients = sorted(rng.choice(num_clients, size=clients_per_round, replace=False).tolist())
+            shadow_round = None
+        else:
+            selected_clients, shadow_round = shadow_scheduler.select_clients()
         downloads = tensor_state_nbytes(global_state) * len(selected_clients)
         updates = []
         compute_seconds = 0.0
         peak_memory = 0
         uploaded = 0
+        client_demands = {}
         round_started = time.perf_counter()
         for client_id in selected_clients:
             local_records = client_records[client_id]
@@ -278,12 +323,20 @@ def run_model_experiment(
             peak_memory = max(peak_memory, update.peak_accelerator_memory_bytes)
             uploaded += update.uploaded_bytes
             downloads += update.downloaded_bytes
+            client_demands[client_id] = {
+                "peak_memory_bytes": update.peak_accelerator_memory_bytes,
+                "compute_time_seconds": update.compute_seconds,
+                "communication_bytes": update.uploaded_bytes + update.downloaded_bytes + tensor_state_nbytes(global_state),
+            }
             print(f"COMPLETED client={client_id + 1}/{num_clients} in {update.compute_seconds:.1f}s", flush=True)
         global_state = sample_weighted_fedavg(updates)
         validation = trainer.evaluate(dataset.validation, global_state)
         test = trainer.evaluate(dataset.test, global_state)
         latency = time.perf_counter() - round_started
         energy_joules = energy_meter.stop()
+        if shadow_scheduler is not None:
+            reconciliation = shadow_scheduler.reconcile(client_demands)
+            shadow_round.update(reconciliation)
         row = {
             "plan_id": model_config["experiment_id"],
             "model_id": model_config["model_id"],
@@ -305,9 +358,40 @@ def run_model_experiment(
             "energy_joules": energy_joules,
             "training_mode": "real_federated",
             "aggregation": "FedAvg",
+
+            "scheduler_policy": scheduling_policy or "seeded_random",
+            "selected_action_id": (
+                shadow_round.get("selected_action_id", "clients:" + ",".join(map(str, selected_clients)))
+                if shadow_round is not None else "clients:" + ",".join(map(str, selected_clients))
+            ),
+            "target_quality": float(exp["target_quality"]),
+            "constraint_provenance": json.dumps(constraints or {}, sort_keys=True),
+            "shadow_pricing": shadow_round,
+
         }
         with round_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row) + "\n")
+
+        action_record = {
+            "plan_id": row["plan_id"], "base_experiment_id": model_config.get("base_experiment_id"),
+            "seed": seed, "round_index": round_index, "scheduler_policy": row["scheduler_policy"],
+            "selected_action_id": row["selected_action_id"], "selected_clients": selected_clients,
+            "target_quality": row["target_quality"], "constraint_provenance": row["constraint_provenance"],
+        }
+        with (round_path.parent / "online_scheduler_actions.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(action_record) + "\n")
+        if shadow_round is not None:
+            price_record = {
+                **action_record,
+                "prices_before": shadow_round.get("prices_before", {}),
+                "prices_after": shadow_round.get("prices_after", {}),
+                "predicted_demand": shadow_round.get("predicted_demand", {}),
+                "realized_demand": shadow_round.get("realized_demand", {}),
+                "availability": shadow_round.get("availability", {}),
+            }
+            with (round_path.parent / "online_shadow_price_trajectory.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(price_record) + "\n")
+
         rounds.append(row)
         if row["validation_utility"] >= float(exp["target_quality"]):
             target_reached = True
@@ -334,6 +418,10 @@ def summarize_model_run(model_config, exp, dataset_name, seed, rounds, target_re
         "dataset": dataset_name,
         "training_mode": "real_federated",
         "aggregation": "FedAvg",
+        "scheduler_policy": final.get("scheduler_policy", "seeded_random"),
+        "base_experiment_id": model_config.get("base_experiment_id", model_config["experiment_id"]),
+        "target_quality": float(exp["target_quality"]),
+        "constraint_provenance": final.get("constraint_provenance", "{}"),
         "validation_utility": final["validation_utility"],
         "validation_macro_f1": final["validation_macro_f1"],
         "test_utility": final["test_utility"],
@@ -346,15 +434,26 @@ def summarize_model_run(model_config, exp, dataset_name, seed, rounds, target_re
         "compute_to_target_seconds": sum(row["compute_time_seconds"] for row in rounds),
         "communication_to_target_bytes": sum(row["bytes_uploaded"] + row["bytes_downloaded"] for row in rounds),
         "latency_to_target_seconds": sum(row["latency_seconds"] for row in rounds),
+        "attained_time_to_target_seconds": (
+            sum(row["latency_seconds"] for row in rounds) if target_reached else None
+        ),
+        "censored_observation_horizon_seconds": (
+            None if target_reached else sum(row["latency_seconds"] for row in rounds)
+        ),
         "mean_round_latency_seconds": sum(row["latency_seconds"] for row in rounds) / len(rounds),
         "privacy_risk": final["privacy_risk"],
+        "shadow_pricing_enabled": final.get("shadow_pricing") is not None,
+        "shadow_prices_final": (
+            json.dumps(final["shadow_pricing"]["prices_after"], sort_keys=True)
+            if final.get("shadow_pricing") is not None
+            else None
+        ),
         "energy_to_target_joules": (
             sum(float(row["energy_joules"]) for row in rounds)
             if all(row["energy_joules"] is not None for row in rounds)
             else None
         ),
     }
-
 
 
 def write_live_reports(rows, output: Path, args, experiment_cfg, models_cfg) -> None:
@@ -383,6 +482,8 @@ def write_live_reports(rows, output: Path, args, experiment_cfg, models_cfg) -> 
         experiment_cfg["experiment"].get("reference_utility", 1.0),
     )
     write_selection(result, output)
+    # Model-plan graphs retain the original model-only x-axis. Scheduler
+    # treatments are compared in their dedicated scheduler figures.
     expected_ids = [item["experiment_id"] for item in models_cfg["federated_experiments"]]
     expected_status = {plan_id: "not_run" for plan_id in expected_ids}
     for item in models_cfg.get("external_models", []):
@@ -394,6 +495,7 @@ def write_live_reports(rows, output: Path, args, experiment_cfg, models_cfg) -> 
         output / "summary",
         expected_plan_ids=expected_ids,
         expected_status=expected_status,
+        constraints=experiment_cfg.get("constraints", {}),
     )
 
 

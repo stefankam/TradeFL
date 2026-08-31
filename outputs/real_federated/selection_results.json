@@ -1,12 +1,12 @@
 {
-  "selected_plan": "bio_clinicalbert_baseline",
-  "score": 4.825706059102925,
+  "selected_plan": "bio_clinicalbert_baseline__static_weighted_sum",
+  "score": 4.820885637469866,
   "normalized_costs": {
-    "memory": 0.2619274854660034,
-    "compute": 0.2588177486713976,
+    "memory": 0.26156383752822876,
+    "compute": 0.25750898631010205,
     "communication": 25.99501896,
     "energy": null,
-    "latency": 0.3884721559192985,
+    "latency": 0.3612220364258004,
     "privacy": 0.5,
     "accuracy": 1.5499999999999998
   },
@@ -22,16 +22,16 @@
   "violated_constraints": [],
   "alternatives": [
     {
-      "plan_id": "bio_clinicalbert_baseline",
-      "score": 4.825948559601967
+      "plan_id": "bio_clinicalbert_baseline__static_weighted_sum",
+      "score": 4.820958274878102
     },
     {
-      "plan_id": "bio_clinicalbert_federated_distillation",
-      "score": 4.859553983856138
+      "plan_id": "bio_clinicalbert_baseline__independent",
+      "score": 4.821055520548148
     },
     {
-      "plan_id": "bio_clinicalbert_federated_distillation",
-      "score": 4.861001639687503
+      "plan_id": "bio_clinicalbert_baseline__tradefl_fixed",
+      "score": 4.821093488016561
     }
   ]
 }

@@ -15,8 +15,42 @@
     "primary_metric": "accuracy",
     "output_dir": "outputs/real_federated",
     "overwrite": true,
-    "plans_config": "configs/plans.yaml"
+    "plans_config": "configs/plans.yaml",
+    "scheduler_treatments": [
+      "tradefl_dynamic",
+      "tradefl_fixed",
+      "independent",
+      "static_weighted_sum",
+      "greedy"
+    ],
+    "shadow_pricing": {
+      "enabled": true,
+      "learning_rate": 0.25,
+      "demand_ema_alpha": 0.5,
+      "update_prices": true,
+      "resources": {
+        "peak_memory_bytes": {
+          "availability": 8589934592,
+          "reducer": "max",
+          "initial_price": 1.1641532182693481e-10,
+          "maximum_price": 1.1641532182693481e-9
+        },
+        "compute_time_seconds": {
+          "availability": 120,
+          "reducer": "sum",
+          "initial_price": 0.008333333333333333,
+          "maximum_price": 0.08333333333333333
+        },
+        "communication_bytes": {
+          "availability": 53687091200,
+          "reducer": "sum",
+          "initial_price": 1.862645149230957e-11,
+          "maximum_price": 1.862645149230957e-10
+        }
+      }
+    }
   },
+
   "dataset": {
     "name": "pubmedqa",
     "paths": {

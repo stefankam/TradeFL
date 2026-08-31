@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 from pathlib import Path as _Path
 
 sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
@@ -15,28 +14,23 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from pathlib import Path
 
-
 from tradefl.scheduling import replay_schedulers
 from tradefl.utils.config import load_yaml
 
-
-
 plt.rcParams.update(
     {
-        "font.size": 14,
+        "font.size": 16,
         "axes.titlesize": 20,
         "axes.labelsize": 16,
-        "xtick.labelsize": 13,
-        "ytick.labelsize": 13,
+        "xtick.labelsize": 15,
+        "ytick.labelsize": 15,
         "legend.fontsize": 13,
         "figure.titlesize": 22,
     }
 )
 
-ANNOTATION_FONT_SIZE = 11
+ANNOTATION_FONT_SIZE = 13
 PARETO_ANNOTATION_FONT_SIZE = 16
-
-
 
 GRAPH_SPECS = [
     ("01_tradefl_score_by_plan.pdf", "tradefl_score", "Deployment-specific TradeFL score by plan", "TradeFL score", "bar"),
@@ -84,18 +78,17 @@ SUMMARY_AGGREGATIONS = {
 
 SUMMARIZE_RESULTS_API_VERSION = 3
 
-
 SCHEDULER_GRAPH_SPECS = [
     ("20_scheduler_overall_task_utility.pdf", "overall_task_utility", "Overall task utility", "Mean test utility"),
     ("21_scheduler_deadline_violation_rate.pdf", "deadline_slo_violation_rate", "Deadline/SLO violation rate", "Violation rate"),
     ("22_scheduler_resource_violation_rate.pdf", "memory_resource_violation_rate", "Memory/resource violation rate", "Violation rate"),
     ("23_scheduler_communication_cost.pdf", "communication_cost_bytes", "Communication cost", "Mean bytes per decision"),
     ("24_scheduler_energy_consumption.pdf", "energy_consumption_joules", "Energy consumption", "Mean joules per decision"),
-    ("25_scheduler_time_to_target.pdf", "time_to_target_seconds", "Time to target / observation horizon", "Mean seconds (hatched = censored)"),
+    ("25_scheduler_time_to_target.pdf", "attained_time_to_target_seconds", "Attained time to target", "Mean seconds among attained tasks"),
     ("26_scheduler_scheduling_overhead.pdf", "scheduling_overhead_microseconds", "Scheduling overhead", "Mean microseconds per decision"),
     ("27_scheduler_target_attainment_rate.pdf", "target_attainment_rate", "Target attainment rate", "Attainment rate"),
+    ("28_scheduler_censored_horizon.pdf", "censored_observation_horizon_seconds", "Censored observation horizon", "Mean seconds among unattained tasks"),
 ]
-
 
 
 def main() -> None:
@@ -147,7 +140,8 @@ def summarize_results(
             f"found {unexpected or ['<missing>']}"
         )
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
-    summary = summarize_frame(df)
+    presentation_df = plan_presentation_frame(df)
+    summary = summarize_frame(presentation_df)
     if expected_plan_ids:
         observed_ids = set(summary["plan_id"].astype(str))
         unexpected_ids = sorted(observed_ids - set(expected_plan_ids))
@@ -162,7 +156,7 @@ def summarize_results(
     graph_dir = Path(str(output_prefix) + "_graphs")
     graph_dir.mkdir(parents=True, exist_ok=True)
     print(f"Generating PDF graphs in: {graph_dir.resolve()}", flush=True)
-    written = write_pdf_graphs(df, summary, graph_dir)
+    written = write_pdf_graphs(presentation_df, summary, graph_dir)
     write_raw_value_tables(summary, graph_dir)
     pareto_rows = []
     for filename, tradeoff, x, y, xlabel, ylabel, x_direction, y_direction, x_scale, y_scale in PARETO_SPECS:
@@ -193,6 +187,33 @@ def summarize_frame(df: pd.DataFrame) -> pd.DataFrame:
     return df.groupby("plan_id", as_index=False).agg(aggregations)
 
 
+def plan_presentation_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Return one scheduler treatment per base model for model-plan figures.
+
+    Scheduler policies remain separate experimental rows in raw outputs and in
+    scheduler figures. Model-plan figures preserve their historical model-only
+    x-axis by preferring the dynamic TradeFL treatment and falling back to the
+    first available treatment for an incomplete live run.
+    """
+
+    if "base_experiment_id" not in df.columns or "scheduler_policy" not in df.columns:
+        return df.copy()
+    federated = df.loc[df["training_mode"] == "real_federated"].copy()
+    external = df.loc[df["training_mode"] != "real_federated"].copy()
+    priority = {
+        "tradefl_dynamic": 0,
+        "tradefl_fixed": 1,
+        "independent": 2,
+        "static_weighted_sum": 3,
+        "greedy": 4,
+        "seeded_random": 5,
+    }
+    federated["_scheduler_priority"] = federated["scheduler_policy"].map(priority).fillna(99)
+    keys = ["base_experiment_id"] + (["seed"] if "seed" in federated.columns else [])
+    federated = federated.sort_values("_scheduler_priority").drop_duplicates(keys).drop(columns="_scheduler_priority")
+    federated["plan_id"] = federated["base_experiment_id"].fillna(federated["plan_id"])
+    return pd.concat([federated, external], ignore_index=True, sort=False)
+
 
 def write_scheduler_replay_graphs(df: pd.DataFrame, graph_dir: Path, constraints: dict) -> list[Path]:
     """Render and persist outputs from scheduling policies owned by tradefl.scheduling."""
@@ -202,20 +223,42 @@ def write_scheduler_replay_graphs(df: pd.DataFrame, graph_dir: Path, constraints
         return []
     replay.decisions.to_csv(graph_dir / "scheduler_replay_decisions.csv", index=False)
     replay.outcomes.to_csv(graph_dir / "scheduler_comparison.csv", index=False)
+    replay.per_seed_outcomes.to_csv(graph_dir / "scheduler_comparison_per_seed.csv", index=False)
     replay.price_trace.to_csv(graph_dir / "scheduler_shadow_price_trace.csv", index=False)
     replay.definitions.to_csv(graph_dir / "scheduler_definitions.csv", index=False)
     written = []
     for filename, metric, title, ylabel in SCHEDULER_GRAPH_SPECS:
         path = graph_dir / filename
-        _scheduler_bar_plot(replay.outcomes, metric, title, ylabel, path)
+        _scheduler_bar_plot(replay.outcomes, replay.per_seed_outcomes, metric, title, ylabel, path)
         written.append(path)
+    dashboard = graph_dir / "29_scheduler_comparison_dashboard.pdf"
+    _scheduler_dashboard(replay.outcomes, replay.per_seed_outcomes, dashboard)
+    written.append(dashboard)
+    actions = graph_dir / "30_scheduler_selected_actions.pdf"
+    _scheduler_action_plot(replay.decisions, actions)
+    written.append(actions)
+    prices = graph_dir / "31_scheduler_shadow_price_trajectory.pdf"
+    _shadow_price_trajectory_plot(replay.price_trace, prices)
+    written.append(prices)
     return written
 
 
-def _scheduler_bar_plot(outcomes: pd.DataFrame, metric: str, title: str, ylabel: str, path: Path) -> None:
+def _scheduler_bar_plot(
+    outcomes: pd.DataFrame, per_seed: pd.DataFrame, metric: str, title: str, ylabel: str, path: Path
+) -> None:
     fig, ax = plt.subplots(figsize=(14, 8))
     values = pd.to_numeric(outcomes[metric], errors="coerce")
     bars = ax.bar(outcomes["scheduler"], values.fillna(0.0), color="tab:purple")
+    low = pd.to_numeric(outcomes.get(f"{metric}_ci95_low"), errors="coerce")
+    high = pd.to_numeric(outcomes.get(f"{metric}_ci95_high"), errors="coerce")
+    if low is not None and high is not None:
+        errors = [values - low, high - values]
+        ax.errorbar(range(len(values)), values, yerr=errors, fmt="none", color="black", capsize=5, zorder=4)
+    scheduler_positions = {scheduler: index for index, scheduler in enumerate(outcomes["scheduler"])}
+    for _, point in per_seed.iterrows():
+        value = pd.to_numeric(point.get(metric), errors="coerce")
+        if pd.notna(value):
+            ax.scatter(scheduler_positions[point["scheduler"]], value, color="white", edgecolor="black", s=45, zorder=5)
     finite_values = values.dropna()
     label_offset = max(float(finite_values.max()) * 0.015, 0.01) if not finite_values.empty else 0.01
     for bar, value, missing in zip(bars, values, values.isna()):
@@ -233,23 +276,86 @@ def _scheduler_bar_plot(outcomes: pd.DataFrame, metric: str, title: str, ylabel:
                 (bar.get_x() + bar.get_width() / 2, max(float(value), 0) + label_offset),
                 ha="center", va="bottom", fontsize=ANNOTATION_FONT_SIZE,
             )
-    if metric == "time_to_target_seconds" and "time_to_target_censoring_rate" in outcomes:
-        for bar, rate in zip(bars, pd.to_numeric(outcomes["time_to_target_censoring_rate"], errors="coerce")):
-            if pd.notna(rate) and rate > 0:
-                bar.set_hatch("//")
-                ax.annotate(
-                    f"{rate:.0%} censored", (bar.get_x() + bar.get_width() / 2, bar.get_height() / 2),
-                    ha="center", va="center", rotation=90, fontsize=ANNOTATION_FONT_SIZE,
-                )
     if metric.endswith("_rate"):
         ax.set_ylim(0, 1.08)
-    ax.set_title(f"Scheduler replay: {title}")
+    ax.set_title(f"Scheduler: {title}")
     ax.set_ylabel(ylabel)
     ax.tick_params(axis="x", rotation=30)
     fig.tight_layout()
     fig.savefig(path, format="pdf")
     plt.close(fig)
 
+
+def _scheduler_dashboard(outcomes: pd.DataFrame, per_seed: pd.DataFrame, path: Path) -> None:
+    """Render a compact comparison of all requested scheduler policies."""
+
+    metrics = [
+        ("overall_task_utility", "Task utility"),
+        ("target_attainment_rate", "Target attainment"),
+        ("deadline_slo_violation_rate", "Deadline/SLO violations"),
+        ("memory_resource_violation_rate", "Memory violations"),
+        ("attained_time_to_target_seconds", "Attained time to target (s)"),
+        ("scheduling_overhead_microseconds", "Scheduling overhead (µs)"),
+    ]
+    fig, axes = plt.subplots(2, 3, figsize=(22, 13))
+    positions = {scheduler: index for index, scheduler in enumerate(outcomes["scheduler"])}
+    for ax, (metric, title) in zip(axes.flat, metrics):
+        values = pd.to_numeric(outcomes[metric], errors="coerce")
+        ax.bar(outcomes["scheduler"], values.fillna(0), color="tab:purple", alpha=0.85)
+        for _, point in per_seed.iterrows():
+            value = pd.to_numeric(point.get(metric), errors="coerce")
+            if pd.notna(value):
+                ax.scatter(positions[point["scheduler"]], value, color="white", edgecolor="black", s=32, zorder=3)
+        ax.set_title(title)
+        ax.tick_params(axis="x", rotation=35, labelsize=9)
+        if metric.endswith("_rate"):
+            ax.set_ylim(0, 1.05)
+    fig.suptitle("Scheduler comparison across common actions and constraints")
+    fig.tight_layout()
+    fig.savefig(path, format="pdf")
+    plt.close(fig)
+
+
+def _scheduler_action_plot(decisions: pd.DataFrame, path: Path) -> None:
+    """Show the actual action-selection frequency for each scheduler."""
+
+    table = pd.crosstab(decisions["scheduler"], decisions["selected_action"])
+    fig, ax = plt.subplots(figsize=(max(14, 0.6 * len(table.columns) + 8), 8))
+    image = ax.imshow(table.to_numpy(), aspect="auto", cmap="Purples")
+    ax.set_xticks(range(len(table.columns)), table.columns, rotation=40, ha="right")
+    ax.set_yticks(range(len(table.index)), table.index)
+    ax.set_xlabel("Selected action / plan")
+    ax.set_ylabel("Scheduler")
+    ax.set_title("Scheduler action-selection frequency")
+    for row in range(len(table.index)):
+        for column in range(len(table.columns)):
+            ax.text(column, row, str(table.iat[row, column]), ha="center", va="center", color="black")
+    fig.colorbar(image, ax=ax, label="Selection count")
+    fig.tight_layout()
+    fig.savefig(path, format="pdf")
+    plt.close(fig)
+
+
+def _shadow_price_trajectory_plot(price_trace: pd.DataFrame, path: Path) -> None:
+    """Plot dynamic TradeFL prices by seed, task, and constrained resource."""
+
+    fig, ax = plt.subplots(figsize=(14, 8))
+    if price_trace.empty:
+        _no_data(ax, "No dynamic shadow-price trace available")
+    else:
+        for (seed, resource), group in price_trace.groupby(["seed", "resource"], dropna=False):
+            ordered = group.sort_values("task_index")
+            ax.plot(
+                ordered["task_index"], ordered["price_after"], marker="o",
+                label=f"seed={seed}, {resource}",
+            )
+        ax.set_xlabel("Workload task index")
+        ax.set_ylabel("Shadow price after reconciliation")
+        ax.legend(fontsize=9, ncol=2)
+    ax.set_title("Dynamic TradeFL shadow-price trajectories")
+    fig.tight_layout()
+    fig.savefig(path, format="pdf")
+    plt.close(fig)
 
 
 
