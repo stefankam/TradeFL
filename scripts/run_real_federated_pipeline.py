@@ -83,6 +83,12 @@ def pipeline_commands(args: argparse.Namespace, select_api: int = 3) -> list[lis
         ]
         for experiment_id in args.experiment_id or []:
             training.extend(["--experiment-id", experiment_id])
+        for policy in getattr(args, "scheduler_policy", None) or []:
+            training.extend(["--scheduler-policy", policy])
+        for population in getattr(args, "full_participation_clients", None) or []:
+            training.extend(["--full-participation-clients", str(population)])
+        if getattr(args, "full_participation_clients", None):
+            training.extend(["--dirichlet-alpha", str(getattr(args, "dirichlet_alpha", 0.5))])
         if args.cpu_smoke_test:
             training.append("--cpu-smoke-test")
         if args.allow_slow_cpu:
@@ -148,6 +154,18 @@ def main() -> None:
     parser.add_argument("--weights", default="configs/weights.yaml")
     parser.add_argument("--weight-method", choices=["configured", "entropy"], default="configured")
     parser.add_argument("--experiment-id", action="append")
+    parser.add_argument(
+        "--scheduler-policy", action="append",
+        choices=["tradefl_dynamic", "tradefl_fixed", "independent", "static_weighted_sum", "greedy"],
+    )
+    parser.add_argument(
+        "--full-participation-clients", action="append", type=int,
+        help="Run a no-selection full-participation baseline; repeat for populations such as 10 and 50.",
+    )
+    parser.add_argument(
+        "--dirichlet-alpha", type=float, default=0.5,
+        help="Label-skew concentration for the full-participation client populations.",
+    )
     parser.add_argument("--cpu-smoke-test", action="store_true")
     parser.add_argument("--allow-slow-cpu", action="store_true")
     parser.add_argument("--strict-hardware", action="store_true")

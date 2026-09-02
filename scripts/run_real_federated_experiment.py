@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python
 """Run sequential, real Transformer client training with sample-weighted FedAvg."""
 from __future__ import annotations
@@ -52,6 +53,20 @@ def main() -> None:
         "--scheduler-policy", action="append", choices=ONLINE_POLICIES,
         help="Run only this online scheduling treatment; repeatable.",
     )
+    parser.add_argument(
+        "--full-participation-clients", action="append", type=int,
+        help=(
+            "Run a no-selection baseline with this many logical clients and all clients participating "
+            "in every round; repeat for populations such as 10 and 50."
+        ),
+    )
+    parser.add_argument(
+        "--dirichlet-alpha", type=float, default=0.5,
+        help=(
+            "Label-skew concentration for full-participation population studies; smaller positive values "
+            "produce more heterogeneous client label distributions."
+        ),
+    )
     parser.add_argument("--strict-hardware", action="store_true", help="Fail instead of skipping models unsupported by this host.")
     parser.add_argument(
         "--cpu-smoke-test",
@@ -91,6 +106,19 @@ def main() -> None:
         parser.error("--external-only cannot be combined with --cpu-smoke-test")
     if args.external_only and args.experiment_id:
         parser.error("--external-only cannot be combined with --experiment-id")
+    if args.append_results and not (args.external_only or args.full_participation_clients):
+        parser.error(
+            "--append-results requires --external-only or --full-participation-clients to prevent accidental "
+            "retraining or duplicate federated rows"
+        )
+    if args.full_participation_clients and args.scheduler_policy:
+        parser.error("--full-participation-clients cannot be combined with --scheduler-policy")
+    if any(population < 2 for population in args.full_participation_clients or []):
+        parser.error("--full-participation-clients values must be at least 2")
+    if args.dirichlet_alpha <= 0:
+        parser.error("--dirichlet-alpha must be positive")
+
+
 
     experiment_cfg = load_yaml(args.experiment_config)
     models_cfg = load_yaml(args.models_config)
