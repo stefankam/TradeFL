@@ -31,6 +31,26 @@ def test_pubmedqa_prompt_constrains_output_labels():
     assert prompt.endswith("answer:")
 
 
+
+def test_full_participation_treatments_use_all_10_and_50_clients_without_scheduler():
+    source = {
+        "num_clients": 5,
+        "client_sampling_ratio": 0.6,
+        "shadow_pricing": {"enabled": True, "learning_rate": 0.25},
+    }
+
+    treatments = runner.full_participation_treatments(source, [10, 50, 10])
+
+    assert [treatment[1]["num_clients"] for treatment in treatments] == [10, 50]
+    assert [treatment[1]["client_sampling_ratio"] for treatment in treatments] == [1.0, 1.0]
+    assert [treatment[0] for treatment in treatments] == [None, None]
+    assert all(treatment[1]["participation_mode"] == "full_participation" for treatment in treatments)
+    assert all(treatment[1]["shadow_pricing"]["enabled"] is False for treatment in treatments)
+    assert source["num_clients"] == 5
+    assert source["shadow_pricing"]["enabled"] is True
+
+
+
 def test_tensor_state_bytes_are_real_array_payload_bytes():
     state = {"a": np.zeros((2, 3), dtype=np.float32), "b": np.zeros(4, dtype=np.int16)}
 

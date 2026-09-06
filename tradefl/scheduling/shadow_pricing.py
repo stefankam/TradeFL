@@ -4,7 +4,7 @@ from __future__ import annotations
 import itertools
 from dataclasses import dataclass
 from typing import Any
-
+import math
 import numpy as np
 
 
@@ -12,7 +12,7 @@ import numpy as np
 class ResourceSpec:
     availability: float
     reducer: str = "sum"
-    initial_price: float = 1.0
+    initial_price: float = 0.0
     maximum_price: float = 10.0
 
 
@@ -32,7 +32,7 @@ class ShadowPriceScheduler:
         self.learning_rate = float(config.get("learning_rate", 0.25))
         self.ema_alpha = float(config.get("demand_ema_alpha", 0.5))
         self.update_prices = bool(config.get("update_prices", True))
-        default_initial = float(config.get("initial_price", 1.0))
+        default_initial = float(config.get("initial_price", 0.0))
         default_maximum = float(config.get("maximum_price", 10.0))
         self.resources = {
             name: ResourceSpec(
@@ -55,6 +55,8 @@ class ShadowPriceScheduler:
         self.prices = {name: spec.initial_price for name, spec in self.resources.items()}
         self._predictions: dict[int, dict[str, float]] = {}
         self._rng = np.random.default_rng(seed)
+        self._epoch = 0
+
 
     def select_clients(self) -> tuple[list[int], dict[str, Any]]:
         """Return the minimum-token-cost candidate subset and its reservation."""
@@ -76,9 +78,12 @@ class ShadowPriceScheduler:
             "token_cost": costs[chosen_index],
         }
 
-    def reconcile(self, client_demands: dict[int, dict[str, float]]) -> dict[str, Any]:
+    def reconcile(
+        self,
+        client_demands: dict[int, dict[str, float]],
+        realized_utility_gain: float | None = None,
+    ) -> dict[str, Any]:
         """Reconcile reservation with realization and apply the projected update."""
-
         for client, demand in client_demands.items():
             previous = self._predictions.get(client)
             self._predictions[client] = {
@@ -93,11 +98,14 @@ class ShadowPriceScheduler:
             for name, spec in self.resources.items():
                 # With raw-demand price p=lambda/A, eta_t=learning_rate/A^2
                 # is exactly the paper's eta_t*(D-A) projected update.
-                eta = self.learning_rate / (spec.availability * spec.availability)
+                eta = self.learning_rate / (
+                    spec.availability * spec.availability * math.sqrt(self._epoch + 1)
+                )
                 self.prices[name] = min(
                     spec.maximum_price,
                     max(0.0, before[name] + eta * (realized[name] - spec.availability)),
                 )
+            self._epoch += 1
         return {
             "realized_demand": realized,
             "availability": {name: spec.availability for name, spec in self.resources.items()},

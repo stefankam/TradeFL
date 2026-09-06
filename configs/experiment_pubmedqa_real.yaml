@@ -28,6 +28,10 @@
       "learning_rate": 0.25,
       "demand_ema_alpha": 0.5,
       "update_prices": true,
+      "utility_ema_alpha": 0.5,
+      "token_bank": {
+        "initial_balance": 100.0
+      },
       "resources": {
         "peak_memory_bytes": {
           "availability": 8589934592,

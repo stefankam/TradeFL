@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import copy
 import json
 import math
@@ -28,7 +29,7 @@ from tradefl.federation.huggingface import (
     unavailable_runtime_reason,
 )
 from tradefl.measurement.energy import EnergyMeter
-from tradefl.scheduling import ONLINE_POLICIES, ShadowPriceScheduler, build_online_scheduler
+from tradefl.scheduling import ONLINE_POLICIES, build_online_scheduler
 from tradefl.selection.feasibility import Constraints
 from tradefl.selection.normalization import Budgets
 from tradefl.selection.scoring import TradeFLWeights
@@ -92,8 +93,13 @@ def main() -> None:
     parser.add_argument(
         "--append-results",
         action="store_true",
-        help="Merge an external-only result into an existing raw_metrics.csv without deleting federated round logs.",
+        help=(
+            "Merge an external-only or full-participation population study into an existing raw_metrics.csv "
+            "without deleting federated round logs."
+        ),
     )
+
+
     parser.add_argument(
         "--allow-slow-cpu",
         action="store_true",
@@ -267,6 +273,7 @@ def apply_cpu_smoke_profile(experiment_cfg: dict, training: dict) -> tuple[dict,
     return experiment_cfg, training
 
 
+
 def scheduler_treatments(exp: dict, selected: list[str] | None = None) -> list[str | None]:
     """Return validated online treatments in deterministic configured order."""
 
@@ -280,6 +287,24 @@ def scheduler_treatments(exp: dict, selected: list[str] | None = None) -> list[s
     if requested - set(configured):
         raise ValueError(f"Requested scheduler policies are not configured: {sorted(requested - set(configured))}")
     return [policy for policy in configured if not requested or policy in requested]
+
+
+
+def full_participation_treatments(exp: dict, populations: list[int] | None) -> list[tuple[None, dict, str]]:
+    """Build deduplicated no-selection treatments without mutating the source config."""
+
+    treatments = []
+    for population in dict.fromkeys(populations or []):
+        population_exp = copy.deepcopy(exp)
+        population_exp["num_clients"] = population
+        population_exp["client_sampling_ratio"] = 1.0
+        population_exp["participation_mode"] = "full_participation"
+        population_exp["shadow_pricing"] = {**population_exp.get("shadow_pricing", {}), "enabled": False}
+        treatments.append((None, population_exp, f"clients_{population}_full_participation"))
+    return treatments
+
+
+
 
 
 def run_model_experiment(
@@ -308,17 +333,31 @@ def run_model_experiment(
     clients_per_round = max(2, math.ceil(num_clients * float(exp.get("client_sampling_ratio", 1.0))))
     clients_per_round = min(num_clients, clients_per_round)
     shadow_config = exp.get("shadow_pricing", {})
-    client_utilities = {client: float(len(records)) for client, records in enumerate(client_records)}
+    client_utilities = estimate_client_utilities(client_records, dataset.labels)
     shadow_scheduler = None
     if scheduling_policy is not None:
         shadow_scheduler = build_online_scheduler(
-            scheduling_policy, num_clients, clients_per_round, shadow_config, seed, client_utilities,
+            scheduling_policy,
+            num_clients,
+            clients_per_round,
+            shadow_config,
+            seed,
+            client_utilities=client_utilities,
+            constraints=constraints,
         )
     elif shadow_config.get("enabled", False):
-        shadow_scheduler = ShadowPriceScheduler(num_clients, clients_per_round, shadow_config, seed)
+        shadow_scheduler = build_online_scheduler(
+            "tradefl_dynamic",
+            num_clients,
+            clients_per_round,
+            shadow_config,
+            seed,
+            client_utilities=client_utilities,
+            constraints=constraints,
+        )
         scheduling_policy = "tradefl_dynamic"
 
-
+    previous_validation_utility = None
     for round_index in range(int(exp["max_rounds"])):
         energy_meter = EnergyMeter()
         energy_meter.start()
@@ -327,6 +366,7 @@ def run_model_experiment(
             shadow_round = None
         else:
             selected_clients, shadow_round = shadow_scheduler.select_clients()
+        no_feasible_plan = shadow_round is not None and not selected_clients
         downloads = tensor_state_nbytes(global_state) * len(selected_clients)
         updates = []
         compute_seconds = 0.0
@@ -357,14 +397,21 @@ def run_model_experiment(
                 "communication_bytes": update.uploaded_bytes + update.downloaded_bytes + tensor_state_nbytes(global_state),
             }
             print(f"COMPLETED client={client_id + 1}/{num_clients} in {update.compute_seconds:.1f}s", flush=True)
-        global_state = sample_weighted_fedavg(updates)
+        if updates:
+            global_state = sample_weighted_fedavg(updates)
         validation = trainer.evaluate(dataset.validation, global_state)
         test = trainer.evaluate(dataset.test, global_state)
         latency = time.perf_counter() - round_started
         energy_joules = energy_meter.stop()
-        if shadow_scheduler is not None:
-            reconciliation = shadow_scheduler.reconcile(client_demands)
+        if shadow_scheduler is not None and not no_feasible_plan:
+            current_validation_utility = float(validation[exp.get("primary_metric", "accuracy")])
+            utility_gain = (
+                None if previous_validation_utility is None
+                else current_validation_utility - previous_validation_utility
+            )
+            reconciliation = shadow_scheduler.reconcile(client_demands, utility_gain)
             shadow_round.update(reconciliation)
+            previous_validation_utility = current_validation_utility
         row = {
             "plan_id": model_config["experiment_id"],
             "model_id": model_config["model_id"],
@@ -395,8 +442,14 @@ def run_model_experiment(
             "target_quality": float(exp["target_quality"]),
             "constraint_provenance": json.dumps(constraints or {}, sort_keys=True),
             "shadow_pricing": shadow_round,
+            "decision_status": (
+                shadow_round.get("decision_status", "selected")
+                if shadow_round is not None else "selected"
+            ),
 
         }
+
+
         with round_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row) + "\n")
 
@@ -416,11 +469,22 @@ def run_model_experiment(
                 "predicted_demand": shadow_round.get("predicted_demand", {}),
                 "realized_demand": shadow_round.get("realized_demand", {}),
                 "availability": shadow_round.get("availability", {}),
+                "reserved_charge": shadow_round.get("reserved_charge"),
+                "refunds": shadow_round.get("refunds", {}),
+                "overruns": shadow_round.get("overruns", {}),
+                "refund_charge": shadow_round.get("refund_charge"),
+                "overrun_charge": shadow_round.get("overrun_charge"),
+                "reconciled_charge": shadow_round.get("reconciled_charge"),
+                "token_balance_after_reconciliation": shadow_round.get(
+                    "token_balance_after_reconciliation"
+                ),
             }
             with (round_path.parent / "online_shadow_price_trajectory.jsonl").open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(price_record) + "\n")
 
         rounds.append(row)
+        if no_feasible_plan:
+            break
         if row["validation_utility"] >= float(exp["target_quality"]):
             target_reached = True
             rounds_to_target = round_index + 1
@@ -434,9 +498,31 @@ def run_model_experiment(
     return summarize_model_run(model_config, exp, dataset.name, seed, rounds, target_reached, rounds_to_target)
 
 
+
+
+def estimate_client_utilities(client_records, labels) -> dict[int, float]:
+    """Build a data-representativeness prior for expected validation gain.
+
+    The online reconciliation replaces this cold-start prior with an EMA of
+    observed validation-utility gains attributed to participating clients.
+    """
+
+    global_counts = Counter(record.label for records in client_records for record in records)
+    global_total = sum(global_counts.values())
+    global_distribution = {label: global_counts[label] / global_total for label in labels}
+    utilities = {}
+    for client, records in enumerate(client_records):
+        counts = Counter(record.label for record in records)
+        total = len(records)
+        distance = 0.5 * sum(
+            abs(counts[label] / total - global_distribution[label]) for label in labels
+        )
+        utilities[client] = 1.0 - distance
+    return utilities
+
+
 def summarize_model_run(model_config, exp, dataset_name, seed, rounds, target_reached, rounds_to_target) -> dict:
     """Build a CSV-ready summary for a completed or in-progress model run."""
-
     final = rounds[-1]
     return {
         "plan_id": model_config["experiment_id"],

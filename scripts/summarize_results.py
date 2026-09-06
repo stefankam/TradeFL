@@ -88,7 +88,20 @@ SCHEDULER_GRAPH_SPECS = [
     ("26_scheduler_scheduling_overhead.pdf", "scheduling_overhead_microseconds", "Scheduling overhead", "Mean microseconds per decision"),
     ("27_scheduler_target_attainment_rate.pdf", "target_attainment_rate", "Target attainment rate", "Attainment rate"),
     ("28_scheduler_censored_horizon.pdf", "censored_observation_horizon_seconds", "Censored observation horizon", "Mean seconds among unattained tasks"),
+    ("32_scheduler_feasible_selection_rate.pdf", "feasible_selection_rate", "Feasible-plan selection rate", "Feasible selection rate"),
 ]
+
+CLIENT_POPULATION_GRAPH_SPECS = [
+    ("32_client_population_test_utility.pdf", "test_utility", "Test utility", "Mean test utility"),
+    ("33_client_population_rounds_completed.pdf", "rounds_completed", "Rounds completed", "Mean rounds"),
+    ("34_client_population_peak_memory.pdf", "peak_memory_bytes", "Peak memory", "Mean peak memory (bytes)"),
+    ("35_client_population_compute.pdf", "compute_to_target_seconds", "Compute", "Mean compute seconds"),
+    ("36_client_population_communication.pdf", "communication_to_target_bytes", "Communication", "Mean communication bytes"),
+    ("37_client_population_latency.pdf", "latency_to_target_seconds", "Latency", "Mean latency seconds"),
+    ("38_client_population_energy.pdf", "energy_to_target_joules", "Energy", "Mean energy (joules)"),
+]
+
+
 
 
 def main() -> None:
@@ -178,6 +191,72 @@ def summarize_results(
     manifest.to_csv(graph_dir / "graph_manifest.csv", index=False)
 
 
+
+def write_client_population_graphs(df: pd.DataFrame, graph_dir: Path) -> list[Path]:
+    """Compare no-selection experiments in which every logical client participates."""
+
+    required = {"client_population", "participation_mode"}
+    if not required.issubset(df.columns):
+        return []
+    rows = df.loc[df["participation_mode"] == "full_participation"].copy()
+    rows["client_population"] = pd.to_numeric(rows["client_population"], errors="coerce")
+    rows = rows.dropna(subset=["client_population"])
+    if rows.empty:
+        return []
+    populations = sorted(rows["client_population"].astype(int).unique())
+    comparison_rows = []
+    written = []
+    for filename, metric, title, ylabel in CLIENT_POPULATION_GRAPH_SPECS:
+        if metric not in rows or pd.to_numeric(rows[metric], errors="coerce").notna().sum() == 0:
+            continue
+        means, lows, highs = [], [], []
+        for population in populations:
+            values = pd.to_numeric(
+                rows.loc[rows["client_population"] == population, metric], errors="coerce",
+            ).dropna()
+            mean = float(values.mean()) if not values.empty else float("nan")
+            half = 1.96 * float(values.std(ddof=1)) / len(values) ** 0.5 if len(values) > 1 else 0.0
+            means.append(mean)
+            lows.append(mean - half)
+            highs.append(mean + half)
+            comparison_rows.append({
+                "client_population": population,
+                "participation_mode": "full_participation",
+                "metric": metric,
+                "mean": mean,
+                "ci95_low": mean - half,
+                "ci95_high": mean + half,
+                "observation_count": len(values),
+            })
+        fig, ax = plt.subplots(figsize=(10, 7))
+        values = pd.Series(means, dtype=float)
+        errors = [values - pd.Series(lows), pd.Series(highs) - values]
+        bars = ax.bar([str(value) for value in populations], values, color="tab:green", alpha=0.85)
+        ax.errorbar(range(len(populations)), values, yerr=errors, fmt="none", color="black", capsize=6)
+        for index, population in enumerate(populations):
+            points = pd.to_numeric(
+                rows.loc[rows["client_population"] == population, metric], errors="coerce",
+            ).dropna()
+            ax.scatter([index] * len(points), points, color="white", edgecolor="black", s=50, zorder=4)
+        for bar, value in zip(bars, values):
+            ax.annotate(
+                "N/A" if pd.isna(value) else f"{value:.3g}",
+                (bar.get_x() + bar.get_width() / 2, 0 if pd.isna(value) else value),
+                ha="center", va="bottom", fontsize=ANNOTATION_FONT_SIZE,
+            )
+        ax.set_title(f"Full participation: {title} by client population")
+        ax.set_xlabel("Logical clients (all participate each round)")
+        ax.set_ylabel(ylabel)
+        fig.tight_layout()
+        path = graph_dir / filename
+        fig.savefig(path, format="pdf")
+        plt.close(fig)
+        written.append(path)
+    pd.DataFrame(comparison_rows).to_csv(graph_dir / "client_population_comparison.csv", index=False)
+    return written
+
+
+
 def summarize_frame(df: pd.DataFrame) -> pd.DataFrame:
     aggregations = {column: agg for column, agg in SUMMARY_AGGREGATIONS.items() if column in df.columns}
     if "plan_id" not in df.columns:
@@ -247,7 +326,10 @@ def _scheduler_bar_plot(
     outcomes: pd.DataFrame, per_seed: pd.DataFrame, metric: str, title: str, ylabel: str, path: Path
 ) -> None:
     fig, ax = plt.subplots(figsize=(14, 8))
-    values = pd.to_numeric(outcomes[metric], errors="coerce")
+    values = pd.to_numeric(
+        outcomes.get(metric, pd.Series(float("nan"), index=outcomes.index)),
+        errors="coerce",
+    )
     bars = ax.bar(outcomes["scheduler"], values.fillna(0.0), color="tab:purple")
     low = pd.to_numeric(outcomes.get(f"{metric}_ci95_low"), errors="coerce")
     high = pd.to_numeric(outcomes.get(f"{metric}_ci95_high"), errors="coerce")
@@ -300,7 +382,10 @@ def _scheduler_dashboard(outcomes: pd.DataFrame, per_seed: pd.DataFrame, path: P
     fig, axes = plt.subplots(2, 3, figsize=(22, 13))
     positions = {scheduler: index for index, scheduler in enumerate(outcomes["scheduler"])}
     for ax, (metric, title) in zip(axes.flat, metrics):
-        values = pd.to_numeric(outcomes[metric], errors="coerce")
+        values = pd.to_numeric(
+            outcomes.get(metric, pd.Series(float("nan"), index=outcomes.index)),
+            errors="coerce",
+        )
         ax.bar(outcomes["scheduler"], values.fillna(0), color="tab:purple", alpha=0.85)
         for _, point in per_seed.iterrows():
             value = pd.to_numeric(point.get(metric), errors="coerce")

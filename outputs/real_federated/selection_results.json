@@ -1,7 +1,15 @@
 {
-  "selected_plan": null,
-  "score": null,
-  "normalized_costs": null,
+  "selected_plan": "bio_clinicalbert_baseline__tradefl_dynamic",
+  "score": 4.924143850855621,
+  "normalized_costs": {
+    "memory": 0.2621723413467407,
+    "compute": 0.5823377034821606,
+    "communication": 25.99501896,
+    "energy": null,
+    "latency": 0.655334095625852,
+    "privacy": 0.5,
+    "accuracy": 1.5499999999999998
+  },
   "effective_weights": {
     "memory": 0.1666666667,
     "compute": 0.1666666667,
@@ -11,9 +19,19 @@
     "privacy": 0.1666666666,
     "accuracy": 0.1666666666
   },
-  "violated_constraints": [
-    "memory_capacity_exceeded",
-    "round_latency_exceeded"
-  ],
-  "alternatives": []
+  "violated_constraints": [],
+  "alternatives": [
+    {
+      "plan_id": "bio_clinicalbert_baseline__tradefl_fixed",
+      "score": 4.924402123979552
+    },
+    {
+      "plan_id": "bio_clinicalbert_baseline__static_weighted_sum",
+      "score": 4.924430902748852
+    },
+    {
+      "plan_id": "bio_clinicalbert_baseline__static_weighted_sum",
+      "score": 4.924435743478174
+    }
+  ]
 }

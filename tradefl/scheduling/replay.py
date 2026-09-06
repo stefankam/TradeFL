@@ -1,6 +1,7 @@
 """Offline scheduler policies and replay engine over measured plan candidates."""
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 
@@ -12,7 +13,7 @@ SCHEDULER_DEFINITIONS = [
     {"scheduler": "Independent/per-resource", "definition": "Minimize the worst independently normalized resource cost."},
     {"scheduler": "Static weighted-sum", "definition": "Minimize an equal, fixed weighted sum without feasibility filtering."},
     {"scheduler": "Greedy", "definition": "Maximize current validation utility without look-ahead."},
-    {"scheduler": "TradeFL fixed prices", "definition": "Same Lagrangian score and initial unit prices as TradeFL, but prices remain fixed at 1.0 for every seed."},
+    {"scheduler": "TradeFL fixed prices", "definition": "Same feasible net-gain objective and 1/capacity warm start as TradeFL, but prices remain fixed for every seed."},
     {"scheduler": "Oracle (enumeration)", "definition": "Hindsight enumeration over the common feasible action set: target attainment first, then test utility, then latency."},
 ]
 
@@ -35,14 +36,15 @@ def replay_schedulers(frame: pd.DataFrame, constraints: dict) -> SchedulerReplay
     candidates = _prepare_candidates(frame)
     cost_columns = _cost_columns(candidates)
     price_rows, decisions = [], []
+    capacities = shadow_resource_capacities(constraints)
+    fixed_prices = {resource: 1.0 / capacity for resource, capacity in capacities.items()}
+    shadow_prices = dict(fixed_prices)
+    trajectory_index = 0
     for seed, seed_group in candidates.groupby("seed", dropna=False):
-        # Independent seeds must never share learned dual state.
-        fixed_prices = {resource: 1.0 for resource in shadow_resource_columns(constraints)}
-        shadow_prices = dict(fixed_prices)
-        for task_index, (task_id, group) in enumerate(seed_group.groupby("workload_task_id", dropna=False)):
+        for task_id, group in seed_group.groupby("workload_task_id", dropna=False):
             normalized = normalize_costs(group, cost_columns)
             feasible = group.loc[group.apply(lambda row: is_feasible(row, constraints), axis=1)]
-            eligible = feasible if not feasible.empty else group
+            oracle_pool = feasible if not feasible.empty else group
             ratios = shadow_resource_ratios(group, constraints)
             policies = (
                 ("TradeFL", lambda: select_tradefl(group, normalized, ratios, shadow_prices)),
@@ -50,7 +52,7 @@ def replay_schedulers(frame: pd.DataFrame, constraints: dict) -> SchedulerReplay
                 ("Static weighted-sum", lambda: select_static_weighted_sum(group, normalized, cost_columns)),
                 ("Greedy", lambda: select_greedy(group)),
                 ("TradeFL fixed prices", lambda: select_fixed_price(group, normalized, ratios, fixed_prices)),
-                ("Oracle (enumeration)", lambda: select_oracle(eligible)),
+                ("Oracle (enumeration)", lambda: select_oracle(oracle_pool)),
             )
             selected_tradefl = None
             for scheduler, policy in policies:
@@ -63,18 +65,23 @@ def replay_schedulers(frame: pd.DataFrame, constraints: dict) -> SchedulerReplay
             assert selected_tradefl is not None
             selected_ratios = ratios.loc[selected_tradefl.name]
             for resource, old_price in list(shadow_prices.items()):
-                violation = float(selected_ratios.get(resource, 0.0)) - 1.0
-                new_price = max(0.0, old_price + 0.25 * violation)
+                selected_ratio = float(selected_ratios.get(resource, 0.0))
+                capacity = capacities[resource]
+                selected_demand = selected_ratio * capacity
+                step_size = 0.25 / (capacity * capacity * math.sqrt(trajectory_index + 1))
+                violation = selected_demand - capacity
+                new_price = min(10.0 / capacity, max(0.0, old_price + step_size * violation))
                 price_rows.append({
-                    "task_index": task_index, "workload_task_id": task_id, "seed": seed,
+                    "task_index": trajectory_index, "workload_task_id": task_id, "seed": seed,
                     "resource": resource, "price_before": old_price,
-                    "selected_ratio": float(selected_ratios.get(resource, 0.0)),
-                    "subgradient": violation, "step_size": 0.25, "price_after": new_price,
-                    "selected_action": selected_tradefl["plan_id"],
+                    "selected_ratio": selected_ratio, "selected_demand": selected_demand,
+                    "capacity": capacity, "subgradient": violation,
+                    "step_size": step_size, "price_after": new_price,
                 })
                 shadow_prices[resource] = new_price
+            trajectory_index += 1
     decision_frame = pd.DataFrame(decisions)
-    per_seed = decision_frame.groupby(["scheduler", "seed"], as_index=False).agg(
+    per_seed = decision_frame.groupby(["scheduler", "seed"], as_index=False, dropna=False).agg(
         overall_task_utility=("task_utility", "mean"),
         deadline_slo_violation_rate=("deadline_slo_violation", "mean"),
         memory_resource_violation_rate=("memory_resource_violation", "mean"),
@@ -84,11 +91,11 @@ def replay_schedulers(frame: pd.DataFrame, constraints: dict) -> SchedulerReplay
         censored_observation_horizon_seconds=("censored_observation_horizon_seconds", "mean"),
         time_to_target_censoring_rate=("time_to_target_censored", "mean"),
         scheduling_overhead_microseconds=("scheduling_overhead_microseconds", "mean"),
-        target_attainment_rate=("target_reached", "mean"),
+        feasible_selection_rate=("selected_feasible", "mean"),
     )
     metrics = [column for column in per_seed if column not in {"scheduler", "seed"}]
     rows = []
-    for scheduler, group in per_seed.groupby("scheduler"):
+    for scheduler, group in per_seed.groupby("scheduler", dropna=False):
         result = {"scheduler": scheduler, "seed_count": group["seed"].nunique()}
         for metric in metrics:
             values = pd.to_numeric(group[metric], errors="coerce").dropna()
@@ -140,16 +147,24 @@ def _prepare_candidates(frame):
         candidates["seed"] = 0
     if "test_utility" not in candidates:
         candidates["test_utility"] = candidates["validation_utility"]
+    if "predicted_utility" not in candidates:
+        # Replay-time validation utility is the prediction available to an
+        # online policy; test utility remains reserved for outcome reporting.
+        candidates["predicted_utility"] = candidates["validation_utility"]
     if "accuracy_loss" not in candidates:
         candidates["accuracy_loss"] = 1.0 - pd.to_numeric(candidates["validation_utility"], errors="coerce")
     if "workload_task_id" not in candidates:
-        # A replay needs more than one arrival per seed for an online policy to
-        # adapt. Repeat the common measured candidate set as a three-task trace.
-        candidates = pd.concat(
-            [candidates.assign(workload_task_id=f"task_{index}") for index in range(3)],
-            ignore_index=True,
-        )
+        # Aggregate run summaries have no explicit task dimension. Treat each
+        # independently measured seed as one task instead of copying every seed
+        # into several synthetic epochs: seed 42 -> task_0, seed 43 -> task_1,
+        # and so on in sorted seed order.
+        task_indices = candidates.groupby("seed", dropna=False, sort=True).ngroup()
+        candidates["workload_task_id"] = task_indices.map(lambda index: f"task_{index}")
+        candidates["workload_task_source"] = "inferred_from_seed"
+    elif "workload_task_source" not in candidates:
+        candidates["workload_task_source"] = "observed"
     return candidates
+
 
 
 def _cost_columns(candidates):
@@ -172,16 +187,26 @@ def normalize_costs(frame, columns):
 
 
 def shadow_resource_columns(constraints):
-    mapping = {
-        "memory": "memory_capacity_bytes", "round_latency": "maximum_round_latency_seconds",
-        "total_latency": "maximum_time_to_target_seconds", "privacy": "maximum_privacy_risk",
-        "quality_floor": "minimum_validation_utility",
-    }
-    return [resource for resource, key in mapping.items() if key in constraints and float(constraints[key]) > 0]
+    return list(shadow_resource_capacities(constraints))
 
+
+def shadow_resource_capacities(constraints):
+    mapping = {
+        "memory": "memory_capacity_bytes",
+        "round_latency": "maximum_round_latency_seconds",
+        "total_latency": "maximum_time_to_target_seconds",
+        "communication": "maximum_communication_bytes",
+        "energy": "maximum_energy_joules",
+    }
+    return {
+        resource: float(constraints[key])
+        for resource, key in mapping.items()
+        if key in constraints and float(constraints[key]) > 0
+    }
 
 def shadow_resource_ratios(group, constraints):
     ratios = pd.DataFrame(index=group.index)
+    ratios.attrs["capacities"] = shadow_resource_capacities(constraints)
     if "memory_capacity_bytes" in constraints:
         ratios["memory"] = pd.to_numeric(group["peak_memory_bytes"], errors="coerce") / float(constraints["memory_capacity_bytes"])
     if "maximum_round_latency_seconds" in constraints:
@@ -189,20 +214,20 @@ def shadow_resource_ratios(group, constraints):
         ratios["round_latency"] = pd.to_numeric(source, errors="coerce") / float(constraints["maximum_round_latency_seconds"])
     if "maximum_time_to_target_seconds" in constraints:
         ratios["total_latency"] = pd.to_numeric(group["latency_to_target_seconds"], errors="coerce") / float(constraints["maximum_time_to_target_seconds"])
-    if "maximum_privacy_risk" in constraints and "privacy_risk" in group:
-        ratios["privacy"] = pd.to_numeric(group["privacy_risk"], errors="coerce") / float(constraints["maximum_privacy_risk"])
-    if "minimum_validation_utility" in constraints:
-        floor = float(constraints["minimum_validation_utility"])
-        ratios["quality_floor"] = (2 * floor - pd.to_numeric(group["validation_utility"], errors="coerce")) / floor
+    if "maximum_communication_bytes" in constraints and "communication_to_target_bytes" in group:
+        ratios["communication"] = pd.to_numeric(group["communication_to_target_bytes"], errors="coerce") / float(constraints["maximum_communication_bytes"])
+    if "maximum_energy_joules" in constraints and "energy_to_target_joules" in group:
+        ratios["energy"] = pd.to_numeric(group["energy_to_target_joules"], errors="coerce") / float(constraints["maximum_energy_joules"])
     return ratios.fillna(0.0)
 
 
 def _minimum_shadow_price_score(group, normalized, ratios, prices):
-    accuracy = normalized["accuracy_loss"] if "accuracy_loss" in normalized else pd.Series(0.0, index=group.index)
-    lagrangian = accuracy.copy()
+    utility = pd.to_numeric(group["predicted_utility"], errors="coerce")
+    net_gain = utility.fillna(float("-inf"))
+    capacities = ratios.attrs.get("capacities", {})
     for resource, price in prices.items():
-        lagrangian = lagrangian + price * (ratios[resource] - 1.0)
-    return group.loc[lagrangian.idxmin()]
+        net_gain = net_gain - price * ratios.loc[group.index, resource] * capacities.get(resource, 1.0)
+    return group.loc[net_gain.idxmax()]
 
 
 def is_feasible(row, constraints):
@@ -211,12 +236,18 @@ def is_feasible(row, constraints):
     total_latency = _number(row.get("latency_to_target_seconds"), 0)
     utility = _number(row.get("validation_utility"), 0)
     privacy = _number(row.get("privacy_risk"), 0)
+    communication = _number(row.get("communication_to_target_bytes"), 0)
+    energy = _number(row.get("energy_to_target_joules"), 0)
     return (
+        bool(row.get("policy_compatible", True))
+        and
         memory <= float(constraints.get("memory_capacity_bytes", float("inf")))
         and round_latency <= float(constraints.get("maximum_round_latency_seconds", float("inf")))
         and total_latency <= float(constraints.get("maximum_time_to_target_seconds", float("inf")))
         and utility >= float(constraints.get("minimum_validation_utility", 0))
         and privacy <= float(constraints.get("maximum_privacy_risk", float("inf")))
+        and communication <= float(constraints.get("maximum_communication_bytes", float("inf")))
+        and energy <= float(constraints.get("maximum_energy_joules", float("inf")))
     )
 
 
@@ -227,8 +258,11 @@ def decision_row(scheduler, seed, task_id, row, overhead_us, constraints):
     target_reached = _target_reached(row)
     return {
         "scheduler": scheduler, "seed": seed, "workload_task_id": task_id,
+        "workload_task_source": row.get("workload_task_source", "observed"),
+        "decision_status": "selected" if is_feasible(row, constraints) else "selected_infeasible",
+        "selected_feasible": float(is_feasible(row, constraints)),
         "selected_plan": row["plan_id"], "selected_action": row["plan_id"],
-        "task_utility": float(pd.to_numeric(row.get("test_utility", row["validation_utility"]), errors="coerce")),
+        "task_utility": float(pd.to_numeric(row.get("predicted_utility", row["validation_utility"]), errors="coerce")),
         "deadline_slo_violation": float(
             round_latency > float(constraints.get("maximum_round_latency_seconds", float("inf")))
             or total_latency > float(constraints.get("maximum_time_to_target_seconds", float("inf")))
@@ -244,6 +278,30 @@ def decision_row(scheduler, seed, task_id, row, overhead_us, constraints):
         "target_quality": _number(row.get("target_quality")),
         "constraint_provenance": row.get("constraint_provenance", "{}"),
     }
+
+
+def no_feasible_decision_row(scheduler, seed, task_id, overhead_us, constraints):
+    """Represent an empty constrained action set without fabricating an outcome."""
+
+    return {
+        "scheduler": scheduler, "seed": seed, "workload_task_id": task_id,
+        "decision_status": "no_feasible_plan",
+        "selected_plan": "NO_FEASIBLE_PLAN", "selected_action": "NO_FEASIBLE_PLAN",
+        "task_utility": float("nan"),
+        "deadline_slo_violation": float("nan"),
+        "memory_resource_violation": float("nan"),
+        "communication_cost_bytes": float("nan"),
+        "energy_consumption_joules": float("nan"),
+        "attained_time_to_target_seconds": float("nan"),
+        "censored_observation_horizon_seconds": float("nan"),
+        "time_to_target_censored": 1.0,
+        "scheduling_overhead_microseconds": overhead_us,
+        "target_reached": 0.0,
+        "target_quality": float("nan"),
+        "constraint_provenance": str(constraints),
+    }
+
+
 
 
 def _target_reached(row) -> bool:
