@@ -36,6 +36,7 @@ class ClientUpdate:
     peak_accelerator_memory_bytes: int
     uploaded_bytes: int
     downloaded_bytes: int = 0
+    training_loss: float | None = None
 
 
 class HuggingFaceClientTrainer:
@@ -152,7 +153,7 @@ class HuggingFaceClientTrainer:
             **trainer_kwargs,
         )
         try:
-            trainer.train()
+            train_result = trainer.train()
         except Exception as exc:
             for handle in split_handles:
                 handle.remove()
@@ -168,7 +169,12 @@ class HuggingFaceClientTrainer:
         for handle in split_handles:
             handle.remove()
         self._release(model, trainer, teacher)
-        return ClientUpdate(state, len(records), elapsed, peak, uploaded, transfer_counter["downloaded_bytes"])
+        training_loss = getattr(train_result, "training_loss", None)
+        return ClientUpdate(
+            state, len(records), elapsed, peak, uploaded,
+            transfer_counter["downloaded_bytes"],
+            None if training_loss is None else float(training_loss),
+        )
 
     def _distillation_trainer_class(self):
         """Build a Trainer using label CE plus temperature-scaled teacher KL."""

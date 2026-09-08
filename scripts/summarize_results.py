@@ -11,6 +11,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 from pathlib import Path
 
@@ -57,7 +58,7 @@ PARETO_SPECS = [
 
 RAW_VALUE_COLUMNS = [
     "plan_id", "peak_memory_bytes", "compute_to_target_seconds", "communication_to_target_bytes",
-    "latency_to_target_seconds", "energy_to_target_joules", "privacy_risk", "validation_utility",
+    "mean_round_latency_seconds", "p95_round_latency_seconds", "latency_to_target_seconds", "energy_to_target_joules", "privacy_risk", "validation_utility",
     "test_utility", "rounds_to_target", "tradefl_score", "feasible", "status",
 ]
 
@@ -67,6 +68,8 @@ SUMMARY_AGGREGATIONS = {
     "compute_to_target_seconds": "mean",
     "communication_to_target_bytes": "mean",
     "latency_to_target_seconds": "mean",
+    "mean_round_latency_seconds": "mean",
+    "p95_round_latency_seconds": "mean",
     "energy_to_target_joules": "mean",
     "validation_utility": "mean",
     "test_utility": "mean",
@@ -80,6 +83,11 @@ SUMMARIZE_RESULTS_API_VERSION = 3
 
 SCHEDULER_GRAPH_SPECS = [
     ("20_scheduler_overall_task_utility.pdf", "overall_task_utility", "Overall task utility", "Mean test utility"),
+    ("20b_scheduler_validation_utility.pdf", "validation_task_utility", "Validation utility used for selection", "Mean validation utility"),
+    ("20c_scheduler_mean_round_latency.pdf", "mean_round_latency_seconds", "Mean round latency", "Seconds"),
+    ("20d_scheduler_p95_round_latency.pdf", "p95_round_latency_seconds", "P95 round latency", "Seconds"),
+    ("20e_scheduler_peak_client_memory.pdf", "peak_client_memory_bytes", "Peak client memory", "Bytes"),
+    ("20f_scheduler_rounds_to_target.pdf", "rounds_to_target", "Rounds to target or censoring", "Observed rounds"),
     ("21_scheduler_deadline_violation_rate.pdf", "deadline_slo_violation_rate", "Deadline/SLO violation rate", "Violation rate"),
     ("22_scheduler_resource_violation_rate.pdf", "memory_resource_violation_rate", "Memory/resource violation rate", "Violation rate"),
     ("23_scheduler_communication_cost.pdf", "communication_cost_bytes", "Communication cost", "Mean bytes per decision"),
@@ -89,16 +97,17 @@ SCHEDULER_GRAPH_SPECS = [
     ("27_scheduler_target_attainment_rate.pdf", "target_attainment_rate", "Target attainment rate", "Attainment rate"),
     ("28_scheduler_censored_horizon.pdf", "censored_observation_horizon_seconds", "Censored observation horizon", "Mean seconds among unattained tasks"),
     ("32_scheduler_feasible_selection_rate.pdf", "feasible_selection_rate", "Feasible-plan selection rate", "Feasible selection rate"),
+    ("33_scheduler_test_regret_to_oracle.pdf", "test_utility_regret_to_oracle", "Test-utility regret relative to oracle", "Oracle test utility - policy test utility"),
 ]
 
 CLIENT_POPULATION_GRAPH_SPECS = [
-    ("32_client_population_test_utility.pdf", "test_utility", "Test utility", "Mean test utility"),
-    ("33_client_population_rounds_completed.pdf", "rounds_completed", "Rounds completed", "Mean rounds"),
-    ("34_client_population_peak_memory.pdf", "peak_memory_bytes", "Peak memory", "Mean peak memory (bytes)"),
-    ("35_client_population_compute.pdf", "compute_to_target_seconds", "Compute", "Mean compute seconds"),
-    ("36_client_population_communication.pdf", "communication_to_target_bytes", "Communication", "Mean communication bytes"),
-    ("37_client_population_latency.pdf", "latency_to_target_seconds", "Latency", "Mean latency seconds"),
-    ("38_client_population_energy.pdf", "energy_to_target_joules", "Energy", "Mean energy (joules)"),
+    ("40_client_population_test_utility.pdf", "test_utility", "Test utility", "Mean test utility"),
+    ("41_client_population_rounds_completed.pdf", "rounds_completed", "Rounds completed", "Mean rounds"),
+    ("42_client_population_peak_memory.pdf", "peak_memory_bytes", "Peak memory", "Mean peak memory (bytes)"),
+    ("43_client_population_compute.pdf", "compute_to_target_seconds", "Compute", "Mean compute seconds"),
+    ("44_client_population_communication.pdf", "communication_to_target_bytes", "Communication", "Mean communication bytes"),
+    ("45_client_population_latency.pdf", "latency_to_target_seconds", "Latency", "Mean latency seconds"),
+    ("46_client_population_energy.pdf", "energy_to_target_joules", "Energy", "Mean energy (joules)"),
 ]
 
 
@@ -179,6 +188,8 @@ def summarize_results(
         )
         written.append(path)
     written.extend(write_scheduler_replay_graphs(df, graph_dir, constraints or {}))
+    written.extend(write_client_population_graphs(df, graph_dir))
+    write_scalability_diagnostics(df, graph_dir)
     invalid_graphs = [path for path in written if not path.exists() or path.stat().st_size == 0]
     if invalid_graphs:
         raise RuntimeError(f"Graph generation did not produce valid PDFs: {[str(path) for path in invalid_graphs]}")
@@ -256,6 +267,39 @@ def write_client_population_graphs(df: pd.DataFrame, graph_dir: Path) -> list[Pa
     return written
 
 
+def write_scalability_diagnostics(df: pd.DataFrame, graph_dir: Path) -> None:
+    """Flag population-study measurements that require provenance review."""
+
+    required = {"client_population", "peak_memory_bytes", "participation_mode"}
+    if not required.issubset(df.columns):
+        return
+    rows = df.loc[df["participation_mode"] == "full_participation"].copy()
+    if rows.empty:
+        return
+    plan_column = "base_experiment_id" if "base_experiment_id" in rows else "plan_id"
+    rows["client_population"] = pd.to_numeric(rows["client_population"], errors="coerce")
+    rows["peak_memory_bytes"] = pd.to_numeric(rows["peak_memory_bytes"], errors="coerce")
+    diagnostics = []
+    for plan_id, group in rows.dropna(subset=["client_population", "peak_memory_bytes"]).groupby(plan_column):
+        means = group.groupby("client_population")["peak_memory_bytes"].mean().sort_index()
+        for (lower_population, lower), (upper_population, upper) in zip(means.items(), list(means.items())[1:]):
+            ratio = upper / lower if lower > 0 else float("nan")
+            diagnostics.append({
+                "plan_id": plan_id,
+                "lower_client_population": int(lower_population),
+                "upper_client_population": int(upper_population),
+                "lower_mean_peak_memory_bytes": lower,
+                "upper_mean_peak_memory_bytes": upper,
+                "upper_to_lower_memory_ratio": ratio,
+                "requires_review": bool(pd.notna(ratio) and (ratio < 0.75 or ratio > 1.25)),
+                "reason": (
+                    "peak accelerator memory changed by more than 25%; verify model/method provenance and raw per-client peaks"
+                    if pd.notna(ratio) and (ratio < 0.75 or ratio > 1.25) else "within tolerance"
+                ),
+            })
+    pd.DataFrame(diagnostics).to_csv(graph_dir / "client_population_memory_diagnostics.csv", index=False)
+
+
 
 def summarize_frame(df: pd.DataFrame) -> pd.DataFrame:
     aggregations = {column: agg for column, agg in SUMMARY_AGGREGATIONS.items() if column in df.columns}
@@ -295,31 +339,122 @@ def plan_presentation_frame(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def write_scheduler_replay_graphs(df: pd.DataFrame, graph_dir: Path, constraints: dict) -> list[Path]:
-    """Render and persist outputs from scheduling policies owned by tradefl.scheduling."""
+    """Plot executed online treatments; retain replay only as a diagnostic."""
 
     replay = replay_schedulers(df, constraints)
-    if replay is None:
+    online = _online_training_scheduler_results(df, constraints)
+    if online is None and replay is None:
         return []
-    replay.decisions.to_csv(graph_dir / "scheduler_replay_decisions.csv", index=False)
-    replay.outcomes.to_csv(graph_dir / "scheduler_comparison.csv", index=False)
-    replay.per_seed_outcomes.to_csv(graph_dir / "scheduler_comparison_per_seed.csv", index=False)
-    replay.price_trace.to_csv(graph_dir / "scheduler_shadow_price_trace.csv", index=False)
-    replay.definitions.to_csv(graph_dir / "scheduler_definitions.csv", index=False)
+    if replay is not None:
+        replay.decisions.to_csv(graph_dir / "offline_replay_decisions.csv", index=False)
+        replay.outcomes.to_csv(graph_dir / "offline_replay_comparison.csv", index=False)
+        replay.per_seed_outcomes.to_csv(graph_dir / "offline_replay_comparison_per_seed.csv", index=False)
+        replay.price_trace.to_csv(graph_dir / "offline_replay_shadow_price_trace.csv", index=False)
+    if online is None:
+        outcomes, per_seed, definitions = replay.outcomes, replay.per_seed_outcomes, replay.definitions
+        outcomes.insert(1, "result_source", "offline_replay_diagnostic")
+        per_seed.insert(2, "result_source", "offline_replay_diagnostic")
+    else:
+        outcomes, per_seed, definitions = online
+    outcomes.to_csv(graph_dir / "scheduler_comparison.csv", index=False)
+    per_seed.to_csv(graph_dir / "scheduler_comparison_per_seed.csv", index=False)
+    definitions.to_csv(graph_dir / "scheduler_definitions.csv", index=False)
+    pd.DataFrame([{
+        "artifact": "20-33 scheduler PDFs and scheduler_comparison*.csv",
+        "result_source": str(outcomes["result_source"].iloc[0]),
+        "proof_column": "scheduler_policy",
+        "note": "Rows are aggregated from separately executed training treatments; offline replay is stored only under offline_replay_*.",
+    }]).to_csv(graph_dir / "scheduler_result_provenance.csv", index=False)
+    pd.DataFrame([{
+        "seed_count": int(per_seed["seed"].nunique()),
+        "recommended_minimum_seed_count": 10,
+        "intervals_are_descriptive": True,
+        "adequate_for_inference": bool(per_seed["seed"].nunique() >= 10),
+        "note": "Paired Student-t intervals describe observed seeds; no hypothesis test is claimed.",
+    }]).to_csv(graph_dir / "scheduler_statistical_scope.csv", index=False)
     written = []
     for filename, metric, title, ylabel in SCHEDULER_GRAPH_SPECS:
         path = graph_dir / filename
-        _scheduler_bar_plot(replay.outcomes, replay.per_seed_outcomes, metric, title, ylabel, path)
+        _scheduler_bar_plot(outcomes, per_seed, metric, title + " — online training", ylabel, path)
         written.append(path)
     dashboard = graph_dir / "29_scheduler_comparison_dashboard.pdf"
-    _scheduler_dashboard(replay.outcomes, replay.per_seed_outcomes, dashboard)
+    _scheduler_dashboard(outcomes, per_seed, dashboard)
     written.append(dashboard)
     actions = graph_dir / "30_scheduler_selected_actions.pdf"
-    _scheduler_action_plot(replay.decisions, actions)
-    written.append(actions)
-    prices = graph_dir / "31_scheduler_shadow_price_trajectory.pdf"
-    _shadow_price_trajectory_plot(replay.price_trace, prices)
-    written.append(prices)
+    if replay is not None:
+        _scheduler_action_plot(replay.decisions, actions)
+        written.append(actions)
+        prices = graph_dir / "31_scheduler_shadow_price_trajectory.pdf"
+        _shadow_price_trajectory_plot(replay.price_trace, prices)
+        written.append(prices)
     return written
+
+
+def _online_training_scheduler_results(df: pd.DataFrame, constraints: dict):
+    """Aggregate only separately executed training treatments, never replay choices."""
+
+    required = {"scheduler_policy", "seed", "test_utility", "validation_utility"}
+    if not required.issubset(df.columns):
+        return None
+    rows = df.loc[df["scheduler_policy"].notna()].copy()
+    rows = rows.loc[~rows["scheduler_policy"].isin(["seeded_random", "centralized_baseline"])]
+    if rows.empty:
+        return None
+    labels = {
+        "random_feasible": "Random feasible", "fedcs": "FedCS", "oort": "Oort",
+        "pedpc": "PEDPC", "greedy": "Greedy", "independent": "Independent",
+        "static_weighted_sum": "Static weighted-sum", "tradefl_fixed": "TradeFL fixed prices",
+        "tradefl_dynamic": "TradeFL",
+    }
+    rows["scheduler"] = rows["scheduler_policy"].map(labels).fillna(rows["scheduler_policy"])
+    numeric = {
+        "overall_task_utility": "test_utility", "validation_task_utility": "validation_utility",
+        "mean_round_latency_seconds": "mean_round_latency_seconds",
+        "p95_round_latency_seconds": "p95_round_latency_seconds",
+        "peak_client_memory_bytes": "peak_memory_bytes", "rounds_to_target": "rounds_completed",
+        "communication_cost_bytes": "communication_to_target_bytes",
+        "energy_consumption_joules": "energy_to_target_joules",
+        "attained_time_to_target_seconds": "attained_time_to_target_seconds",
+        "censored_observation_horizon_seconds": "censored_observation_horizon_seconds",
+        "scheduling_overhead_microseconds": "scheduling_overhead_microseconds",
+    }
+    records = []
+    for (scheduler, seed), group in rows.groupby(["scheduler", "seed"], dropna=False):
+        record = {"scheduler": scheduler, "seed": seed, "result_source": "online_training"}
+        for metric, source in numeric.items():
+            values = pd.to_numeric(group[source], errors="coerce").dropna() if source in group else pd.Series(dtype=float)
+            record[metric] = values.mean() if not values.empty else float("nan")
+        latency_limit = constraints.get("maximum_round_latency_seconds")
+        memory_limit = constraints.get("memory_capacity_bytes")
+        mean_latency = pd.to_numeric(group.get("mean_round_latency_seconds"), errors="coerce")
+        memory = pd.to_numeric(group.get("peak_memory_bytes"), errors="coerce")
+        record["deadline_slo_violation_rate"] = (mean_latency > float(latency_limit)).mean() if latency_limit is not None else float("nan")
+        record["memory_resource_violation_rate"] = (memory > float(memory_limit)).mean() if memory_limit is not None else float("nan")
+        reached = group.get("target_reached", pd.Series(False, index=group.index)).astype(str).str.lower().isin(["true", "1"])
+        record["target_attainment_rate"] = reached.mean()
+        record["time_to_target_censoring_rate"] = 1.0 - reached.mean()
+        feasible = group.get("feasible", pd.Series(float("nan"), index=group.index))
+        feasible = feasible.astype(str).str.lower().map({"true": 1.0, "false": 0.0})
+        record["feasible_selection_rate"] = feasible.mean()
+        record["test_utility_regret_to_oracle"] = float("nan")
+        records.append(record)
+    per_seed = pd.DataFrame(records)
+    aggregates = []
+    for scheduler, group in per_seed.groupby("scheduler", dropna=False):
+        result = {"scheduler": scheduler, "result_source": "online_training", "seed_count": group["seed"].nunique()}
+        for metric in [c for c in per_seed if c not in {"scheduler", "seed", "result_source"}]:
+            values = pd.to_numeric(group[metric], errors="coerce").dropna()
+            mean = values.mean() if not values.empty else float("nan")
+            critical = {2: 12.706, 3: 4.303}.get(len(values), 1.96)
+            half = critical * values.std(ddof=1) / np.sqrt(len(values)) if len(values) > 1 else 0.0
+            result.update({metric: mean, f"{metric}_ci95_low": mean - half, f"{metric}_ci95_high": mean + half,
+                           f"{metric}_n": len(values), f"{metric}_ci95_method": "descriptive Student-t" if len(values) > 1 else "not estimable"})
+        aggregates.append(result)
+    definitions = pd.DataFrame([{
+        "scheduler": label, "result_source": "online_training",
+        "definition": "Executed as a separate federated training treatment; see scheduler_policy in raw_metrics.csv.",
+    } for label in labels.values() if label in set(per_seed["scheduler"])])
+    return pd.DataFrame(aggregates), per_seed, definitions
 
 
 def _scheduler_bar_plot(
@@ -330,17 +465,39 @@ def _scheduler_bar_plot(
         outcomes.get(metric, pd.Series(float("nan"), index=outcomes.index)),
         errors="coerce",
     )
+    if values.notna().sum() == 0:
+        ax.text(
+            0.5, 0.5,
+            "No feasible selections are available yet.\n"
+            "This live metric will populate when a feasible plan completes.",
+            transform=ax.transAxes, ha="center", va="center",
+            fontsize=16, fontweight="bold",
+        )
+        ax.set_title(f"Scheduler: {title}")
+        ax.set_ylabel(ylabel)
+        ax.set_xticks([])
+        fig.tight_layout()
+        fig.savefig(path, format="pdf")
+        plt.close(fig)
+        return
     bars = ax.bar(outcomes["scheduler"], values.fillna(0.0), color="tab:purple")
     low = pd.to_numeric(outcomes.get(f"{metric}_ci95_low"), errors="coerce")
     high = pd.to_numeric(outcomes.get(f"{metric}_ci95_high"), errors="coerce")
     if low is not None and high is not None:
-        errors = [values - low, high - values]
-        ax.errorbar(range(len(values)), values, yerr=errors, fmt="none", color="black", capsize=5, zorder=4)
+        finite = values.notna() & low.notna() & high.notna()
+        if finite.any():
+            positions = [index for index, keep in enumerate(finite) if keep]
+            central = values.loc[finite]
+            errors = [central - low.loc[finite], high.loc[finite] - central]
+            ax.errorbar(positions, central, yerr=errors, fmt="none", color="black", capsize=5, zorder=4)
     scheduler_positions = {scheduler: index for index, scheduler in enumerate(outcomes["scheduler"])}
     for _, point in per_seed.iterrows():
         value = pd.to_numeric(point.get(metric), errors="coerce")
-        if pd.notna(value):
-            ax.scatter(scheduler_positions[point["scheduler"]], value, color="white", edgecolor="black", s=45, zorder=5)
+        if pd.notna(value) and np.isfinite(float(value)):
+            # Use the categorical scheduler label consistently with ax.bar;
+            # mixing numeric offsets into a categorical axis fails for masked
+            # values on recent Matplotlib releases.
+            ax.scatter(str(point["scheduler"]), float(value), color="white", edgecolor="black", s=45, zorder=5)
     finite_values = values.dropna()
     label_offset = max(float(finite_values.max()) * 0.015, 0.01) if not finite_values.empty else 0.01
     for bar, value, missing in zip(bars, values, values.isna()):

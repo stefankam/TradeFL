@@ -23,6 +23,41 @@ def iid_partition_indices(num_examples: int, num_clients: int, seed: int) -> lis
     return [partition.copy() for partition in np.array_split(indices, num_clients)]
 
 
+def dirichlet_label_partition_indices(
+    labels: Sequence[object], num_clients: int, seed: int, alpha: float,
+) -> list[np.ndarray]:
+    """Partition examples with reproducible label skew and no empty clients."""
+
+    if len(labels) < num_clients:
+        raise ValueError("num_clients cannot exceed number of labeled examples")
+    if num_clients < 2:
+        raise ValueError("real federated training requires at least two clients")
+    if alpha <= 0:
+        raise ValueError("Dirichlet alpha must be positive")
+    rng = np.random.default_rng(seed)
+    clients: list[list[int]] = [[] for _ in range(num_clients)]
+    labels_array = np.asarray(labels, dtype=object)
+    for label in sorted(set(labels), key=str):
+        indices = np.flatnonzero(labels_array == label)
+        rng.shuffle(indices)
+        proportions = rng.dirichlet(np.full(num_clients, alpha))
+        counts = rng.multinomial(len(indices), proportions)
+        cursor = 0
+        for client, count in enumerate(counts):
+            clients[client].extend(indices[cursor:cursor + count].tolist())
+            cursor += count
+    # A very small alpha can leave clients empty. Move one record at a time
+    # from the largest client so every logical client performs real work.
+    for empty in [index for index, rows in enumerate(clients) if not rows]:
+        donor = max(range(num_clients), key=lambda index: len(clients[index]))
+        if len(clients[donor]) <= 1:
+            raise ValueError("could not construct non-empty Dirichlet client partitions")
+        clients[empty].append(clients[donor].pop())
+    for rows in clients:
+        rng.shuffle(rows)
+    return [np.asarray(rows, dtype=int) for rows in clients]
+
+
 def sample_weighted_fedavg(updates: Sequence[tuple[TensorState, int]]) -> dict[str, np.ndarray]:
     """Aggregate matching client tensors using client example counts as weights."""
 

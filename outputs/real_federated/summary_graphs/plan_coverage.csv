@@ -1,8 +1,8 @@
 plan_id,observed,status
 llama3_8b_qlora,True,completed
-llama3_8b_lora,True,completed
-deepseek_r1_distill_llama_8b_lora,True,completed
-bio_clinicalbert_baseline,True,completed
-bio_clinicalbert_splitfed,True,completed
-bio_clinicalbert_federated_distillation,True,completed
+llama3_8b_lora,False,not_run
+deepseek_r1_distill_llama_8b_lora,False,not_run
+bio_clinicalbert_baseline,False,not_run
+bio_clinicalbert_splitfed,False,not_run
+bio_clinicalbert_federated_distillation,False,not_run
 qwen2_5_7b_centralized_baseline,False,external_not_federated

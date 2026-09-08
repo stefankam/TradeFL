@@ -156,8 +156,7 @@ def main() -> None:
     parser.add_argument("--experiment-id", action="append")
     parser.add_argument(
         "--scheduler-policy", action="append",
-        choices=["tradefl_dynamic", "tradefl_fixed", "independent", "static_weighted_sum", "greedy"],
-<<<<<<< HEAD
+        choices=["random_feasible", "fedcs", "oort", "pedpc", "tradefl_dynamic", "tradefl_fixed", "static_weighted_sum"],
     )
     parser.add_argument(
         "--full-participation-clients", action="append", type=int,
@@ -167,9 +166,6 @@ def main() -> None:
         "--dirichlet-alpha", type=float, default=0.5,
         help="Label-skew concentration for the full-participation client populations.",
     )
-=======
-        )
->>>>>>> 73b8b61 (most probems fixed except dynamic utility comparison)
     parser.add_argument("--cpu-smoke-test", action="store_true")
     parser.add_argument("--allow-slow-cpu", action="store_true")
     parser.add_argument("--strict-hardware", action="store_true")

@@ -1,8 +1,8 @@
-plan_id,peak_memory_bytes,compute_to_target_seconds,communication_to_target_bytes,latency_to_target_seconds,energy_to_target_joules,privacy_risk,validation_utility,test_utility,rounds_to_target,tradefl_score,feasible,status
-llama3_8b_qlora,20308030805.333332,370.96596019732533,81788928.0,998.2562213860025,34424.1814553112,0.25,0.6966666666666667,0.6833333333333332,1.0,,False,completed
-llama3_8b_lora,32215419904.0,150.32319525833978,81788928.0,657.9940313909998,18075.71339840096,0.25,0.73,0.7266666666666666,1.0,,False,completed
-deepseek_r1_distill_llama_8b_lora,32215419904.0,149.79323435466117,81788928.0,644.0853144806655,17913.310718560973,0.25,0.7399999999999999,0.67,1.0,,False,completed
-bio_clinicalbert_baseline,7026848256.0,582.7795673023114,51990037920.0,787.5544558833257,19372.532145745674,0.25,0.57,0.4766666666666666,,4.949268488022474,True,completed
-bio_clinicalbert_splitfed,2252980736.0,583.7293604962373,73244980640.0,794.1734472550257,19444.234167526174,0.25,0.59,0.49,,6.696718728466579,True,completed
-bio_clinicalbert_federated_distillation,2684336640.0,690.817011870114,51990037920.0,901.8255978263818,27434.008430431164,0.25,0.59,0.49,,4.966642536993251,True,completed
-qwen2_5_7b_centralized_baseline,,,,,,,,,,,,external_not_federated
+plan_id,peak_memory_bytes,compute_to_target_seconds,communication_to_target_bytes,mean_round_latency_seconds,p95_round_latency_seconds,latency_to_target_seconds,energy_to_target_joules,privacy_risk,validation_utility,test_utility,rounds_to_target,tradefl_score,feasible,status
+llama3_8b_qlora,17698064725.333332,368.10408323570545,81788928.0,588.2258333659944,881.5773203194966,1176.4516667319888,38618.037961000315,0.25,0.5133333333333333,0.4666666666666666,,,False,completed
+llama3_8b_lora,,,,,,,,,,,,,,not_run
+deepseek_r1_distill_llama_8b_lora,,,,,,,,,,,,,,not_run
+bio_clinicalbert_baseline,,,,,,,,,,,,,,not_run
+bio_clinicalbert_splitfed,,,,,,,,,,,,,,not_run
+bio_clinicalbert_federated_distillation,,,,,,,,,,,,,,not_run
+qwen2_5_7b_centralized_baseline,,,,,,,,,,,,,,external_not_federated

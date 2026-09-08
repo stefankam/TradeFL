@@ -21,7 +21,11 @@ from scripts.obtain_data import ensure_dataset_available
 from tradefl.data import load_dataset_bundle
 from tradefl.backends.openai_baseline import evaluate_openai_baseline
 from tradefl.backends.huggingface_baseline import evaluate_huggingface_baseline
-from tradefl.federation.fedavg import iid_partition_indices, sample_weighted_fedavg
+from tradefl.federation.fedavg import (
+    dirichlet_label_partition_indices,
+    iid_partition_indices,
+    sample_weighted_fedavg,
+)
 from tradefl.federation.huggingface import (
     HuggingFaceClientTrainer,
     UnsupportedRuntimeError,
@@ -155,7 +159,12 @@ def main() -> None:
     if args.append_results and not raw_path.exists():
         raise SystemExit(f"Cannot append results because {raw_path} does not exist.")
     if not args.append_results:
-        round_path.unlink(missing_ok=True)
+        for live_path in (
+            round_path,
+            output / "online_scheduler_actions.jsonl",
+            output / "online_shadow_price_trajectory.jsonl",
+        ):
+            live_path.unlink(missing_ok=True)
     summaries = pd.read_csv(raw_path).to_dict("records") if args.append_results else []
     skipped_path = output / "skipped_experiments.json"
     skipped = json.loads(skipped_path.read_text(encoding="utf-8")) if args.append_results and skipped_path.exists() else []
@@ -322,7 +331,16 @@ def run_model_experiment(
 
     set_seed(seed)
     num_clients = int(exp["num_clients"])
-    partitions = iid_partition_indices(len(dataset.train), num_clients, seed)
+    partition_mode = str(exp.get("client_partition", "iid"))
+    if partition_mode == "iid":
+        partitions = iid_partition_indices(len(dataset.train), num_clients, seed)
+    elif partition_mode == "dirichlet_label_skew":
+        partitions = dirichlet_label_partition_indices(
+            [record.label for record in dataset.train], num_clients, seed,
+            float(exp.get("dirichlet_alpha", 0.5)),
+        )
+    else:
+        raise ValueError(f"unknown client_partition {partition_mode!r}")
     client_records = [[dataset.train[int(index)] for index in partition] for partition in partitions]
     trainer = HuggingFaceClientTrainer(model_config, dataset.labels, training)
     global_state = trainer.initial_state()
@@ -365,7 +383,11 @@ def run_model_experiment(
             selected_clients = sorted(rng.choice(num_clients, size=clients_per_round, replace=False).tolist())
             shadow_round = None
         else:
+            scheduling_started = time.perf_counter_ns()
             selected_clients, shadow_round = shadow_scheduler.select_clients()
+            shadow_round["scheduling_overhead_microseconds"] = (
+                time.perf_counter_ns() - scheduling_started
+            ) / 1000.0
         no_feasible_plan = shadow_round is not None and not selected_clients
         downloads = tensor_state_nbytes(global_state) * len(selected_clients)
         updates = []
@@ -373,6 +395,7 @@ def run_model_experiment(
         peak_memory = 0
         uploaded = 0
         client_demands = {}
+        client_losses = {}
         round_started = time.perf_counter()
         for client_id in selected_clients:
             local_records = client_records[client_id]
@@ -385,7 +408,10 @@ def run_model_experiment(
                 f"client={client_id + 1}/{num_clients} examples={len(local_records)}",
                 flush=True,
             )
+            client_energy_meter = EnergyMeter()
+            client_energy_meter.start()
             update = trainer.train_client(local_records, global_state)
+            client_energy_joules = client_energy_meter.stop()
             updates.append((update.state, update.num_examples))
             compute_seconds += update.compute_seconds
             peak_memory = max(peak_memory, update.peak_accelerator_memory_bytes)
@@ -395,7 +421,12 @@ def run_model_experiment(
                 "peak_memory_bytes": update.peak_accelerator_memory_bytes,
                 "compute_time_seconds": update.compute_seconds,
                 "communication_bytes": update.uploaded_bytes + update.downloaded_bytes + tensor_state_nbytes(global_state),
+                # Extra telemetry is consumed by PEDPC but is not part of the
+                # shared feasibility gate unless configured as a resource.
+                "energy_joules": client_energy_joules,
             }
+            if update.training_loss is not None:
+                client_losses[client_id] = update.training_loss
             print(f"COMPLETED client={client_id + 1}/{num_clients} in {update.compute_seconds:.1f}s", flush=True)
         if updates:
             global_state = sample_weighted_fedavg(updates)
@@ -409,7 +440,7 @@ def run_model_experiment(
                 None if previous_validation_utility is None
                 else current_validation_utility - previous_validation_utility
             )
-            reconciliation = shadow_scheduler.reconcile(client_demands, utility_gain)
+            reconciliation = shadow_scheduler.reconcile(client_demands, utility_gain, client_losses)
             shadow_round.update(reconciliation)
             previous_validation_utility = current_validation_utility
         row = {
@@ -458,6 +489,7 @@ def run_model_experiment(
             "seed": seed, "round_index": round_index, "scheduler_policy": row["scheduler_policy"],
             "selected_action_id": row["selected_action_id"], "selected_clients": selected_clients,
             "target_quality": row["target_quality"], "constraint_provenance": row["constraint_provenance"],
+            "result_source": "online_training",
         }
         with (round_path.parent / "online_scheduler_actions.jsonl").open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(action_record) + "\n")
@@ -532,6 +564,14 @@ def summarize_model_run(model_config, exp, dataset_name, seed, rounds, target_re
         "dataset": dataset_name,
         "training_mode": "real_federated",
         "aggregation": "FedAvg",
+        "client_partition": str(exp.get("client_partition", "iid")),
+        "dirichlet_alpha": (
+            float(exp.get("dirichlet_alpha", 0.5))
+            if exp.get("client_partition", "iid") == "dirichlet_label_skew" else None
+        ),
+        "client_population": int(exp["num_clients"]),
+        "participation_mode": exp.get("participation_mode", "sampled"),
+        "memory_aggregation": "maximum peak accelerator allocation across clients and rounds",
         "scheduler_policy": final.get("scheduler_policy", "seeded_random"),
         "base_experiment_id": model_config.get("base_experiment_id", model_config["experiment_id"]),
         "target_quality": float(exp["target_quality"]),
@@ -555,6 +595,10 @@ def summarize_model_run(model_config, exp, dataset_name, seed, rounds, target_re
             None if target_reached else sum(row["latency_seconds"] for row in rounds)
         ),
         "mean_round_latency_seconds": sum(row["latency_seconds"] for row in rounds) / len(rounds),
+        "p95_round_latency_seconds": float(np.percentile([row["latency_seconds"] for row in rounds], 95)),
+        "wall_clock_time_to_target_seconds": (
+            sum(row["latency_seconds"] for row in rounds) if target_reached else None
+        ),
         "privacy_risk": final["privacy_risk"],
         "shadow_pricing_enabled": final.get("shadow_pricing") is not None,
         "shadow_prices_final": (
@@ -567,6 +611,10 @@ def summarize_model_run(model_config, exp, dataset_name, seed, rounds, target_re
             if all(row["energy_joules"] is not None for row in rounds)
             else None
         ),
+        "scheduling_overhead_microseconds": float(np.mean([
+            row["shadow_pricing"].get("scheduling_overhead_microseconds", float("nan"))
+            for row in rounds if row.get("shadow_pricing") is not None
+        ])) if any(row.get("shadow_pricing") is not None for row in rounds) else None,
     }
 
 

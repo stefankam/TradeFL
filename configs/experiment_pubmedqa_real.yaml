@@ -1,6 +1,8 @@
 {
   "experiment": {
     "num_clients": 5,
+    "client_partition": "dirichlet_label_skew",
+    "dirichlet_alpha": 0.5,
     "client_sampling_ratio": 0.6,
     "local_epochs": 1,
     "batch_size": 64,
@@ -17,11 +19,15 @@
     "overwrite": true,
     "plans_config": "configs/plans.yaml",
     "scheduler_treatments": [
+      "random_feasible",
+      "fedcs",
+      "oort",
+      "pedpc",
+      "greedy",
+      "independent",
       "tradefl_dynamic",
       "tradefl_fixed",
-      "independent",
-      "static_weighted_sum",
-      "greedy"
+      "static_weighted_sum"
     ],
     "shadow_pricing": {
       "enabled": true,
@@ -29,6 +35,10 @@
       "demand_ema_alpha": 0.5,
       "update_prices": true,
       "utility_ema_alpha": 0.5,
+      "pedpc": {
+        "v": 1.0,
+        "client_energy_budget_joules": 144000.0
+      },
       "token_bank": {
         "initial_balance": 100.0
       },

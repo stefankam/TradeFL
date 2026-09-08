@@ -10,7 +10,12 @@ class Constraints:
 def check_feasibility(metrics: dict[str,object], constraints: Constraints) -> FeasibilityResult:
     v=[]
     if float(metrics.get('peak_memory_bytes',0)) > constraints.memory_capacity_bytes: v.append('memory_capacity_exceeded')
-    if float(metrics.get('mean_round_latency_seconds', metrics.get('latency_to_target_seconds',0))) > constraints.maximum_round_latency_seconds: v.append('round_latency_exceeded')
+    # Round and cumulative latency are different measurements. Missing round
+    # latency must fail closed instead of silently comparing total latency to a
+    # per-round SLO (or treating the missing value as zero).
+    round_latency = metrics.get('mean_round_latency_seconds')
+    if round_latency is None: v.append('round_latency_measurement_missing')
+    elif float(round_latency) > constraints.maximum_round_latency_seconds: v.append('round_latency_exceeded')
     if float(metrics.get('latency_to_target_seconds',0)) > constraints.maximum_time_to_target_seconds: v.append('time_to_target_exceeded')
     if float(metrics.get('validation_utility',0)) < constraints.minimum_validation_utility: v.append('minimum_validation_utility_not_met')
     if float(metrics.get('privacy_risk',0)) > constraints.maximum_privacy_risk: v.append('privacy_risk_exceeded')

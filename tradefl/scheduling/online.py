@@ -13,6 +13,10 @@ from tradefl.scheduling.shadow_pricing import ResourceSpec
 
 
 ONLINE_POLICIES = (
+    "random_feasible",
+    "fedcs",
+    "oort",
+    "pedpc",
     "tradefl_dynamic",
     "tradefl_fixed",
     "independent",
@@ -52,6 +56,7 @@ class OnlineScheduler(ABC):
         if not 0.0 <= self.ema_alpha <= 1.0 or not 0.0 <= self.utility_ema_alpha <= 1.0:
             raise ValueError("demand and utility EMA alpha values must be between zero and one")
         self.resources = _resource_specs(config)
+        self.constraints = dict(constraints or {})
         self.prices = {name: spec.initial_price for name, spec in self.resources.items()}
         self.client_utilities = client_utilities or {client: 1.0 for client in range(num_clients)}
         policy = config.get("policy_constraints", {})
@@ -69,6 +74,9 @@ class OnlineScheduler(ABC):
         self._pending_reservation: dict[str, Any] | None = None
         self._epoch = 0
         self._rng = np.random.default_rng(seed)
+        self.selection_counts = {client: 0 for client in range(num_clients)}
+        self.last_selected_epoch = {client: -1 for client in range(num_clients)}
+        self.client_losses: dict[int, float] = {}
 
 
 
@@ -99,11 +107,8 @@ class OnlineScheduler(ABC):
                 "token_balance_after_reservation": self.token_balance,
                 "token_balance_after_reconciliation": self.token_balance,
             }
-        unseen = [sum(client not in self._predictions for client in action.clients) for action in affordable]
-        maximum_unseen = max(unseen)
-        eligible = [action for action, count in zip(affordable, unseen) if count == maximum_unseen]
         started_prices = dict(self.prices)
-        selected, score = self.choose(eligible)
+        selected, score = self.choose(affordable)
         token_cost = self._token_cost(selected)
         balance_before = self.token_balance
         self.token_balance -= token_cost
@@ -113,6 +118,9 @@ class OnlineScheduler(ABC):
             "prices": started_prices,
             "reserved_charge": token_cost,
         }
+        for client in selected.clients:
+            self.selection_counts[client] += 1
+            self.last_selected_epoch[client] = self._epoch
         telemetry = {
             "policy": self.policy_name,
             "decision_status": "selected",
@@ -157,9 +165,14 @@ class OnlineScheduler(ABC):
         self,
         client_demands: dict[int, dict[str, float]],
         realized_utility_gain: float | None = None,
+        client_losses: dict[int, float] | None = None,
     ) -> dict[str, Any]:
         if self._pending_reservation is None:
             raise RuntimeError("cannot reconcile without a pending token reservation")
+        if client_losses:
+            for client, loss in client_losses.items():
+                old = self.client_losses.get(client, float(loss))
+                self.client_losses[client] = self.utility_ema_alpha * float(loss) + (1.0 - self.utility_ema_alpha) * old
         for client, demand in client_demands.items():
             previous = self._predictions.get(client)
             self._predictions[client] = {
@@ -192,6 +205,7 @@ class OnlineScheduler(ABC):
                 )
         before = dict(self.prices)
         self._update_prices(realized)
+        self._epoch += 1
         self._pending_reservation = None
         return {
             "realized_demand": realized,
@@ -245,7 +259,10 @@ class OnlineScheduler(ABC):
             and not clients.intersection(self.forbidden_clients)
             and not any(pair.issubset(clients) for pair in self.incompatible_pairs)
         )
-        return policy_compatible and all(
+        utility_feasible = action.predicted_utility >= float(
+            self.constraints.get("minimum_validation_utility", float("-inf"))
+        )
+        return policy_compatible and utility_feasible and all(
             action.predicted_demand[name] <= spec.availability for name, spec in self.resources.items()
         )
 
@@ -270,7 +287,6 @@ class DynamicPriceScheduler(OnlineScheduler):
                 spec.maximum_price,
                 max(0.0, self.prices[name] + eta * (realized[name] - spec.availability)),
             )
-        self._epoch += 1
 
 
 class FixedPriceScheduler(DynamicPriceScheduler):
@@ -316,10 +332,103 @@ class GreedyUtilityScheduler(OnlineScheduler):
         return action.predicted_utility
 
 
+class RandomFeasibleScheduler(OnlineScheduler):
+    policy_name = "random_feasible"
+
+    def choose(self, actions):
+        index = int(self._rng.integers(len(actions)))
+        return actions[index], 0.0
+
+
+class FedCSScheduler(OnlineScheduler):
+    policy_name = "fedcs"
+
+    def choose(self, actions):
+        """FedCS selection phase instantiated with measured local completion time.
+
+        The common experiment fixes the selected cardinality, so maximizing the
+        number completed before the deadline reduces to choosing the action with
+        the smallest predicted completion time.
+        """
+        latency_resource = "compute_time_seconds" if "compute_time_seconds" in self.resources else next(iter(self.resources))
+        scores = [action.predicted_demand[latency_resource] for action in actions]
+        return self._pick_minimum(actions, scores)
+
+
+class OortScheduler(OnlineScheduler):
+    policy_name = "oort"
+
+    def choose(self, actions):
+        """Oort-style utility, system-efficiency, exploration, and staleness score."""
+        latency_resource = "compute_time_seconds" if "compute_time_seconds" in self.resources else next(iter(self.resources))
+        exploration = float(self.constraints.get("oort_exploration_factor", 0.3))
+        scores = []
+        for action in actions:
+            client_scores = []
+            for client in action.clients:
+                # Oort's statistical utility is loss based. Before a client has
+                # a measured loss, the label-representativeness prior is used.
+                statistical = self.client_losses.get(client, self.client_utilities.get(client, 1.0))
+                duration = self._predictions.get(client, {}).get(latency_resource, 0.0)
+                duration = max(duration, 1e-12)
+                uncertainty = math.sqrt(math.log(self._epoch + 2.0) / (self.selection_counts[client] + 1.0))
+                staleness = max(0, self._epoch - self.last_selected_epoch[client])
+                client_scores.append(statistical / duration + exploration * uncertainty * math.sqrt(staleness + 1.0))
+            scores.append(sum(client_scores))
+        maximum = max(scores)
+        tied = [index for index, score in enumerate(scores) if np.isclose(score, maximum)]
+        index = int(self._rng.choice(tied))
+        return actions[index], scores[index]
+
+
+class PEDPCScheduler(DynamicPriceScheduler):
+    policy_name = "pedpc"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        pedpc = args[2].get("pedpc", {}) if len(args) >= 3 else {}
+        self.pedpc_v = float(pedpc.get("v", 1.0))
+        self.energy_budget = float(pedpc.get("client_energy_budget_joules", 5000.0))
+        self.energy_queues = {client: 0.0 for client in range(self.num_clients)}
+        self.energy_predictions: dict[int, float] = {}
+
+    def choose(self, actions):
+        scores = []
+        for action in actions:
+            queue_penalty = sum(
+                self.energy_queues[client]
+                * (self.energy_predictions.get(client, self.energy_budget) - self.energy_budget)
+                for client in action.clients
+            )
+            scores.append(queue_penalty + self.pedpc_v * (1.0 - action.predicted_utility))
+        return self._pick_minimum(actions, scores)
+
+    def reconcile(self, client_demands, realized_utility_gain=None, client_losses=None):
+        for client, demand in client_demands.items():
+            energy = demand.get("energy_joules")
+            if energy is not None:
+                old = self.energy_predictions.get(client, float(energy))
+                self.energy_predictions[client] = self.ema_alpha * float(energy) + (1.0 - self.ema_alpha) * old
+                self.energy_queues[client] = max(
+                    0.0, self.energy_queues[client] + float(energy) - self.energy_budget
+                )
+        result = super().reconcile(client_demands, realized_utility_gain, client_losses)
+        result["pedpc_energy_deficit_queues"] = dict(self.energy_queues)
+        return result
+
+    def _update_prices(self, realized):
+        # PEDPC updates virtual energy-deficit queues, not TradeFL token prices.
+        return None
+
+
 def build_online_scheduler(
     policy, num_clients, clients_per_round, config, seed, client_utilities=None, constraints=None,
 ):
     classes = {
+        "random_feasible": RandomFeasibleScheduler,
+        "fedcs": FedCSScheduler,
+        "oort": OortScheduler,
+        "pedpc": PEDPCScheduler,
         "tradefl_dynamic": DynamicPriceScheduler,
         "tradefl_fixed": FixedPriceScheduler,
         "independent": IndependentResourceScheduler,
